@@ -1,0 +1,12 @@
+# so sandbox
+FROM ubuntu:24.04
+
+RUN apt-get update -qq \
+  && apt-get install -y --no-install-recommends sudo curl ca-certificates \
+  && useradd -m -s /bin/bash so \
+  && echo "so ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+USER so
+RUN curl -fsSL https://raw.githubusercontent.com/arvinmi/so/main/src/templates/so-tools.sh | bash
+
+CMD ["bash"]

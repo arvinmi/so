@@ -1,0 +1,26 @@
+[package]
+name = "so"
+version = "0.1.0"
+edition = "2024"
+description = "Sandbox for your agents"
+authors = ["Arvin <hello@arvinmir.com>"]
+license = "MIT"
+repository = "https://github.com/arvinmi/so"
+readme = "README.md"
+keywords = ["cli", "agent"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
+colored = "3"
+chrono = "0.4"
+dirs = "6"
+serde_json = "1"
+console = "0.16"
+
+[profile.release]
+lto = true
+strip = true
