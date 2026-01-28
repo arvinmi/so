@@ -14,12 +14,67 @@ use colored::Colorize;
 use thiserror::Error;
 use tokio::process::Command;
 
-// =============================================================================
-// Constants
-// =============================================================================
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Harness {
+  Claude,
+  Opencode,
+  Codex,
+}
 
-const VALID_HARNESSES: &[&str] = &["claude", "opencode", "codex"];
-const VALID_SANDBOXES: &[&str] = &["docker", "bwrap"];
+impl Harness {
+  fn as_str(self) -> &'static str {
+    match self {
+      Harness::Claude => "claude",
+      Harness::Opencode => "opencode",
+      Harness::Codex => "codex",
+    }
+  }
+}
+
+impl std::str::FromStr for Harness {
+  type Err = Error;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    if s.eq_ignore_ascii_case("claude") {
+      Ok(Harness::Claude)
+    } else if s.eq_ignore_ascii_case("opencode") {
+      Ok(Harness::Opencode)
+    } else if s.eq_ignore_ascii_case("codex") {
+      Ok(Harness::Codex)
+    } else {
+      Err(Error::InvalidHarness(s.into()))
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SandboxType {
+  Docker,
+  Bwrap,
+}
+
+impl SandboxType {
+  fn as_str(self) -> &'static str {
+    match self {
+      SandboxType::Docker => "docker",
+      SandboxType::Bwrap => "bwrap",
+    }
+  }
+}
+
+impl std::str::FromStr for SandboxType {
+  type Err = Error;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    if s.eq_ignore_ascii_case("docker") {
+      Ok(SandboxType::Docker)
+    } else if s.eq_ignore_ascii_case("bwrap") {
+      Ok(SandboxType::Bwrap)
+    } else {
+      Err(Error::InvalidSandbox(s.into()))
+    }
+  }
+}
 
 // =============================================================================
 // Error
@@ -104,10 +159,10 @@ enum Cmd {
   Menu,
 }
 
-fn parse_args(first: &str, second: Option<u32>, default: u32) -> (String, u32) {
+fn parse_args(first: &str, second: Option<u32>, default: u32) -> Result<(Harness, u32), Error> {
   match first.parse::<u32>() {
-    Ok(n) => ("claude".into(), n),
-    Err(_) => (first.into(), second.unwrap_or(default)),
+    Ok(n) => Ok((Harness::Claude, n)),
+    Err(_) => Ok((first.parse::<Harness>()?, second.unwrap_or(default))),
   }
 }
 
@@ -134,31 +189,34 @@ enum RunMode {
 
 #[tokio::main]
 async fn main() {
-  let cli = Cli::parse();
-  let result = match cli.command.unwrap_or(Cmd::Menu) {
-    Cmd::Step { first, second } => {
-      let (h, n) = parse_args(&first, second, 1);
-      do_step(&h, n).await
-    }
-    Cmd::Run { first, second } => {
-      let (h, n) = parse_args(&first, second, 10);
-      do_run(&h, n).await
-    }
-    Cmd::Plan { harness } => do_plan(&harness).await,
-    Cmd::Clean { first, second } => {
-      let (h, n) = parse_args(&first, second, 10);
-      do_clean(&h, n).await
-    }
-    Cmd::Dup { first, second } => {
-      let (h, n) = parse_args(&first, second, 10);
-      do_dup(&h, n).await
-    }
-    Cmd::Menu => do_menu().await,
-    Cmd::Learn { harness } => do_learn(&harness).await,
-  };
-  if let Err(e) = result {
+  if let Err(e) = run().await {
     eprintln!("{} {}", "error:".red().bold(), e);
     std::process::exit(1);
+  }
+}
+
+async fn run() -> Result<(), Error> {
+  let cli = Cli::parse();
+  match cli.command.unwrap_or(Cmd::Menu) {
+    Cmd::Step { first, second } => {
+      let (h, n) = parse_args(&first, second, 1)?;
+      do_step(h, n).await
+    }
+    Cmd::Run { first, second } => {
+      let (h, n) = parse_args(&first, second, 10)?;
+      do_run(h, n).await
+    }
+    Cmd::Plan { harness } => do_plan(harness.parse()?).await,
+    Cmd::Clean { first, second } => {
+      let (h, n) = parse_args(&first, second, 10)?;
+      do_clean(h, n).await
+    }
+    Cmd::Dup { first, second } => {
+      let (h, n) = parse_args(&first, second, 10)?;
+      do_dup(h, n).await
+    }
+    Cmd::Menu => do_menu().await,
+    Cmd::Learn { harness } => do_learn(harness.parse()?).await,
   }
 }
 
@@ -166,16 +224,8 @@ async fn main() {
 // Validation
 // =============================================================================
 
-fn validate_harness(h: &str) -> Result<(), Error> {
-  if VALID_HARNESSES.contains(&h) { Ok(()) } else { Err(Error::InvalidHarness(h.into())) }
-}
-
-fn validate_sandbox() -> Result<(), Error> {
-  let st = sandbox_type();
-  if !VALID_SANDBOXES.contains(&st.as_str()) {
-    return Err(Error::InvalidSandbox(st));
-  }
-  if st == "bwrap" {
+fn validate_sandbox(st: SandboxType) -> Result<(), Error> {
+  if st == SandboxType::Bwrap {
     if cfg!(target_os = "macos") {
       return Err(Error::Other("bwrap not available on macOS, use SANDBOX=docker".into()));
     }
@@ -193,16 +243,15 @@ fn validate_sandbox() -> Result<(), Error> {
   Ok(())
 }
 
-fn sandbox_type() -> String {
-  std::env::var("SANDBOX").unwrap_or_else(|_| "docker".into()).to_lowercase()
+fn sandbox_type() -> Result<SandboxType, Error> {
+  std::env::var("SANDBOX").unwrap_or_else(|_| "docker".into()).parse()
 }
 
 // =============================================================================
 // Commands
 // =============================================================================
 
-async fn do_step(harness: &str, iterations: u32) -> Result<(), Error> {
-  validate_harness(harness)?;
+async fn do_step(harness: Harness, iterations: u32) -> Result<(), Error> {
   let cwd = std::env::current_dir()?;
   let unattended = std::env::var("SO_UNATTENDED").is_ok();
   let mode = if unattended { RunMode::Run } else { RunMode::Step };
@@ -226,11 +275,10 @@ async fn do_step(harness: &str, iterations: u32) -> Result<(), Error> {
   Ok(())
 }
 
-async fn do_run(harness: &str, iterations: u32) -> Result<(), Error> {
-  validate_harness(harness)?;
-  validate_sandbox()?;
+async fn do_run(harness: Harness, iterations: u32) -> Result<(), Error> {
+  let st = sandbox_type()?;
+  validate_sandbox(st)?;
   let cwd = std::env::current_dir()?;
-  let st = sandbox_type();
 
   if sandbox::git_dirty(&cwd)? {
     return Err(Error::UncommittedChanges);
@@ -239,26 +287,31 @@ async fn do_run(harness: &str, iterations: u32) -> Result<(), Error> {
     return Err(Error::NoPrompt);
   }
 
-  print_info(&format!("Creating sandbox (run) [{}]", st));
+  print_info(&format!("Creating sandbox (run) [{}]", st.as_str()));
   let sb = sandbox::Sandbox::new(&cwd, sandbox::Mode::Run, None)?;
   println!("  {}", sb.path.display().to_string().dimmed());
 
   let start = Instant::now();
   let effective_max = effective_max(&sb.path, iterations);
-  print_sandbox_start(harness, effective_max, &st, &sb.task_id);
+  print_sandbox_start(harness, effective_max, st, &sb.task_id);
   finalize_sandbox(&sb, harness, effective_max, &cwd, start).await
 }
 
-async fn do_clean(harness: &str, iterations: u32) -> Result<(), Error> {
+async fn do_clean(harness: Harness, iterations: u32) -> Result<(), Error> {
   let prompt = r#"Ignore any existing specs/ files.
-Scan for code smells: unused exports, dead code, inconsistent patterns.
+
+Review codebase super carefully with fresh eyes. Look for:
+- Bugs, errors, or incorrect logic
+- Code smells: unused exports, dead code, inconsistent patterns
+- Confusing or unclear code
+
 Fix one issue per iteration.
 Commit: "clean: <description>"
 When nothing left, set specs/status.md to "Status: done""#;
   run_with_prompt(harness, iterations, prompt, sandbox::Mode::Clean).await
 }
 
-async fn do_dup(harness: &str, iterations: u32) -> Result<(), Error> {
+async fn do_dup(harness: Harness, iterations: u32) -> Result<(), Error> {
   let prompt = r#"Ignore any existing specs/ files.
 Run jscpd.
 Pick one duplicate from the report.
@@ -268,11 +321,10 @@ When nothing left, set specs/status.md to "Status: done""#;
   run_with_prompt(harness, iterations, prompt, sandbox::Mode::Dup).await
 }
 
-async fn run_with_prompt(harness: &str, iterations: u32, prompt: &str, mode: sandbox::Mode) -> Result<(), Error> {
-  validate_harness(harness)?;
-  validate_sandbox()?;
+async fn run_with_prompt(harness: Harness, iterations: u32, prompt: &str, mode: sandbox::Mode) -> Result<(), Error> {
+  let st = sandbox_type()?;
+  validate_sandbox(st)?;
   let cwd = std::env::current_dir()?;
-  let st = sandbox_type();
 
   if sandbox::git_dirty(&cwd)? {
     return Err(Error::UncommittedChanges);
@@ -283,17 +335,16 @@ async fn run_with_prompt(harness: &str, iterations: u32, prompt: &str, mode: san
     sandbox::Mode::Clean => "clean",
     sandbox::Mode::Dup => "dup",
   };
-  print_info(&format!("Creating sandbox ({}) [{}]", mode_name, st));
+  print_info(&format!("Creating sandbox ({}) [{}]", mode_name, st.as_str()));
   let sb = sandbox::Sandbox::new(&cwd, mode, Some(prompt))?;
   println!("  {}", sb.path.display().to_string().dimmed());
 
   let start = Instant::now();
-  print_sandbox_start(harness, iterations, &st, &sb.task_id);
+  print_sandbox_start(harness, iterations, st, &sb.task_id);
   finalize_sandbox(&sb, harness, iterations, &cwd, start).await
 }
 
-async fn do_plan(harness: &str) -> Result<(), Error> {
-  validate_harness(harness)?;
+async fn do_plan(harness: Harness) -> Result<(), Error> {
   let cwd = std::env::current_dir()?;
   let specs = cwd.join("specs");
   std::fs::create_dir_all(&specs)?;
@@ -315,26 +366,36 @@ async fn do_plan(harness: &str) -> Result<(), Error> {
 
 Never write code, only specs."#;
 
-  println!("{}", format!("▶ Planning [{}]", harness).cyan().bold());
+  println!("{}", format!("▶ Planning [{}]", harness.as_str()).cyan().bold());
   run_harness(harness, prompt, RunMode::Step, TaskMode::Plan, &cwd).await
 }
 
-async fn do_learn(harness: &str) -> Result<(), Error> {
-  validate_harness(harness)?;
+async fn do_learn(harness: Harness) -> Result<(), Error> {
   let cwd = std::env::current_dir()?;
 
-  let prompt = r#"Help me learn this. Explain as we go, first principles, keep it simple.
+  let prompt = r#"Teaching mode: help me learn, don't solve for me.
+
+Rules:
+- Explain concepts, errors, and "why", not just "how"
+- Ask clarifying questions about what I've tried
+- Point to relevant lectures, docs, or codebase patterns
+- Debug by asking guiding questions, not providing fixes
+- Suggest approaches, don't implement them
+- Code examples: max 2-5 lines, single concept, different names, explain each line
+- Encourage adapting examples, not copying
+- Never write full functions, TODO completions, assignment solutions, quiz/exam answers, or large refactors
 
 Approach:
-- Explain what and why as you work through it
-- Go slow, one step at a time
 - First principles, build understanding from fundamentals
+- Go slow, one step at a time
+- Review my code and point out improvements
 - Simple explanations, no unnecessary complexity
-- You can implement, just make sure I follow along
 
-Start by asking what I want to learn or work through."#;
+When in doubt: explain more, code less.
 
-  println!("{}", format!("▶ Learn [{}]", harness).cyan().bold());
+Start by asking what I want to learn."#;
+
+  println!("{}", format!("▶ Learn [{}]", harness.as_str()).cyan().bold());
   run_harness(harness, prompt, RunMode::Step, TaskMode::Learn, &cwd).await
 }
 
@@ -491,7 +552,7 @@ async fn do_menu() -> Result<(), Error> {
 // Run loop
 // =============================================================================
 
-async fn run_loop(mode: RunMode, harness: &str, max: u32, cwd: &Path) -> Result<(), Error> {
+async fn run_loop(mode: RunMode, harness: Harness, max: u32, cwd: &Path) -> Result<(), Error> {
   let prompt_path = cwd.join("specs/prompt.md");
   let status_path = cwd.join("specs/status.md");
   let unattended = std::env::var("SO_UNATTENDED").is_ok();
@@ -551,7 +612,7 @@ async fn run_loop(mode: RunMode, harness: &str, max: u32, cwd: &Path) -> Result<
 fn task_count(cwd: &Path) -> Option<u32> {
   let plan = cwd.join("specs/implementation-plan.md");
   let content = std::fs::read_to_string(plan).ok()?;
-  let count = content.lines().filter(|l| l.contains("- [ ]")).count();
+  let count = content.lines().filter(|l| l.trim_start().starts_with("- [ ]")).count();
   if count == 0 { None } else { Some(count as u32) }
 }
 
@@ -559,12 +620,11 @@ fn task_count(cwd: &Path) -> Option<u32> {
 // Harness
 // =============================================================================
 
-async fn run_harness(harness: &str, prompt: &str, mode: RunMode, task: TaskMode, cwd: &Path) -> Result<(), Error> {
+async fn run_harness(harness: Harness, prompt: &str, mode: RunMode, task: TaskMode, cwd: &Path) -> Result<(), Error> {
   match harness {
-    "claude" => run_claude(prompt, mode, cwd).await,
-    "opencode" => run_opencode(prompt, mode, task, cwd).await,
-    "codex" => run_codex(prompt, mode, task, cwd).await,
-    _ => Err(Error::InvalidHarness(harness.into())),
+    Harness::Claude => run_claude(prompt, mode, cwd).await,
+    Harness::Opencode => run_opencode(prompt, mode, task, cwd).await,
+    Harness::Codex => run_codex(prompt, mode, task, cwd).await,
   }
 }
 
@@ -680,7 +740,7 @@ fn check_status_code(status: std::process::ExitStatus, name: &str) -> Result<(),
 // Helpers
 // =============================================================================
 
-async fn enforce_commit(harness: &str, cwd: &Path) {
+async fn enforce_commit(harness: Harness, cwd: &Path) {
   let msg = "Commit now. Message format:\n- What: <what was done>\n- Why: <reasoning>\n- Alternatives: <what else was considered>";
   for i in 1..=3 {
     if !sandbox::git_dirty(cwd).unwrap_or(false) {
@@ -718,12 +778,12 @@ fn effective_max(cwd: &Path, max: u32) -> u32 {
 
 async fn finalize_sandbox(
   sb: &sandbox::Sandbox,
-  harness: &str,
+  harness: Harness,
   iterations: u32,
   cwd: &Path,
   start: Instant,
 ) -> Result<(), Error> {
-  let result = sandbox::run(sb, harness, iterations).await;
+  let result = sandbox::run(sb, harness.as_str(), iterations).await;
   match result {
     Ok(()) => {
       println!();
@@ -950,17 +1010,17 @@ fn print_info(msg: &str) {
   println!("{}", format!("▶ {}", msg).yellow().bold());
 }
 
-fn print_header(harness: &str, cur: u32, total: u32) {
-  println!("{}", format!("▶ [{}] {}/{}", harness, cur, total).cyan().bold());
+fn print_header(harness: Harness, cur: u32, total: u32) {
+  println!("{}", format!("▶ [{}] {}/{}", harness.as_str(), cur, total).cyan().bold());
 }
 
-fn print_header_time(harness: &str, cur: u32, total: u32, time: &str) {
-  println!("{}", format!("▶ [{}] {}/{} | {}", harness, cur, total, time).cyan().bold());
+fn print_header_time(harness: Harness, cur: u32, total: u32, time: &str) {
+  println!("{}", format!("▶ [{}] {}/{} | {}", harness.as_str(), cur, total, time).cyan().bold());
 }
 
-fn print_sandbox_start(harness: &str, n: u32, st: &str, task_id: &str) {
-  println!("{}", format!("▶ Starting [{}] max={} [{}]", harness, n, st).green().bold());
-  if harness == "claude" {
+fn print_sandbox_start(harness: Harness, n: u32, st: SandboxType, task_id: &str) {
+  println!("{}", format!("▶ Starting [{}] max={} [{}]", harness.as_str(), n, st.as_str()).green().bold());
+  if harness == Harness::Claude {
     println!("{}", format!("  Tasks: {}", task_id).magenta());
   }
   println!();

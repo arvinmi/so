@@ -1,5 +1,6 @@
 use std::{
   collections::HashSet,
+  ffi::{OsStr, OsString},
   path::{Path, PathBuf},
   process::Stdio,
 };
@@ -16,11 +17,14 @@ use crate::Error;
 pub const BASE_TAG: &str = "so-base";
 
 fn is_bwrap() -> bool {
-  std::env::var("SANDBOX").unwrap_or_else(|_| "docker".into()).to_lowercase() == "bwrap"
+  match std::env::var("SANDBOX") {
+    Ok(v) => v.eq_ignore_ascii_case("bwrap"),
+    Err(_) => false,
+  }
 }
 
-fn project_name(p: &Path) -> &str {
-  p.file_name().and_then(|n| n.to_str()).unwrap_or("project")
+fn project_name(p: &Path) -> &OsStr {
+  p.file_name().unwrap_or_else(|| OsStr::new("project"))
 }
 
 // =============================================================================
@@ -43,7 +47,7 @@ pub struct Sandbox {
 
 impl Sandbox {
   pub fn new(original: &Path, mode: Mode, prompt: Option<&str>) -> Result<Self, Error> {
-    let project = project_name(original);
+    let project = project_name(original).to_string_lossy();
     let ts = chrono::Utc::now().timestamp();
     let path = PathBuf::from(format!("/tmp/sandbox-{}-{}", project, ts));
     let task_id = format!("so-{}-{}", project, ts);
@@ -63,6 +67,18 @@ pub struct Info {
   pub status: String,
 }
 
+fn parse_sandbox_timestamp(name: &str) -> Option<u64> {
+  let rest = name.strip_prefix("sandbox-")?;
+  let (project, ts) = rest.rsplit_once('-')?;
+  if project.is_empty() || ts.is_empty() {
+    return None;
+  }
+  if !ts.as_bytes().iter().all(|b| b.is_ascii_digit()) {
+    return None;
+  }
+  ts.parse::<u64>().ok()
+}
+
 pub fn list() -> Result<Vec<Info>, Error> {
   let mut out = Vec::new();
   for e in std::fs::read_dir("/tmp")? {
@@ -70,7 +86,10 @@ pub fn list() -> Result<Vec<Info>, Error> {
     let name = e.file_name().to_string_lossy().to_string();
     if name.starts_with("sandbox-") {
       let path = e.path();
-      let created = e.metadata()?.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+      let fallback = e.metadata().ok().and_then(|m| m.modified().ok()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+      let created = parse_sandbox_timestamp(&name)
+        .and_then(|ts| std::time::SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(ts)))
+        .unwrap_or(fallback);
       let status = path.join("specs/status.md");
       let status = if status.exists() {
         let c = std::fs::read_to_string(&status).unwrap_or_default().to_lowercase();
@@ -100,7 +119,7 @@ pub async fn run(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), Err
 }
 
 async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), Error> {
-  let project = project_name(&sb.original);
+  let project = project_name(&sb.original).to_string_lossy();
   let dockerfile = sb.original.join("Dockerfile.sandbox");
   if !dockerfile.exists() {
     return Err(Error::NoDockerfile);
@@ -193,91 +212,102 @@ async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), E
   let code = home.join(project_name(&sb.original));
   let creds = setup_creds()?;
 
-  let mut a: Vec<String> = Vec::new();
-  let mut created_dirs: HashSet<String> = HashSet::new();
+  let mut a: Vec<OsString> = Vec::new();
+  let mut created_dirs: HashSet<PathBuf> = HashSet::new();
 
   // system (ro)
-  ro(&mut a, "/usr");
-  ro(&mut a, "/lib");
-  ro(&mut a, "/bin");
-  if_exists_ro(&mut a, "/lib64");
-  if_exists_ro(&mut a, "/sbin");
-  if_exists_ro(&mut a, "/snap");
+  ro(&mut a, Path::new("/usr"));
+  ro(&mut a, Path::new("/lib"));
+  ro(&mut a, Path::new("/bin"));
+  if_exists_ro(&mut a, Path::new("/lib64"));
+  if_exists_ro(&mut a, Path::new("/sbin"));
+  if_exists_ro(&mut a, Path::new("/snap"));
 
   // network and ssl (ro)
-  ro(&mut a, "/etc/resolv.conf");
-  ro(&mut a, "/etc/hosts");
-  ro(&mut a, "/etc/passwd");
-  ro(&mut a, "/etc/group");
-  if_exists_ro(&mut a, "/etc/ssl");
-  if_exists_ro(&mut a, "/etc/ca-certificates");
+  ro(&mut a, Path::new("/etc/resolv.conf"));
+  ro(&mut a, Path::new("/etc/hosts"));
+  ro(&mut a, Path::new("/etc/passwd"));
+  ro(&mut a, Path::new("/etc/group"));
+  if_exists_ro(&mut a, Path::new("/etc/ssl"));
+  if_exists_ro(&mut a, Path::new("/etc/ca-certificates"));
 
   // home tmpfs
-  check_dir(&mut a, &mut created_dirs, &home.display().to_string());
-  a.extend(["--tmpfs".into(), home.display().to_string()]);
+  check_dir(&mut a, &mut created_dirs, &home);
+  push_arg(&mut a, "--tmpfs");
+  push_path(&mut a, &home);
 
   // tools (ro)
   for d in [".nvm", ".cargo", ".rustup", ".pyenv", ".deno", "go", ".sdkman", ".ssh"] {
-    if_exists_ro(&mut a, &home.join(d).display().to_string());
+    if_exists_ro(&mut a, &home.join(d));
   }
 
   // conda (ro)
   let conda = ["miniforge3", "anaconda3", "miniconda3"];
   for d in &conda {
-    if_exists_ro(&mut a, &home.join(d).display().to_string());
+    if_exists_ro(&mut a, &home.join(d));
   }
 
   // writable tool dirs (tmpfs)
   for d in [".local", ".bun"] {
     let p = home.join(d);
-    check_dir(&mut a, &mut created_dirs, &p.display().to_string());
-    a.extend(["--tmpfs".into(), p.display().to_string()]);
+    check_dir(&mut a, &mut created_dirs, &p);
+    push_arg(&mut a, "--tmpfs");
+    push_path(&mut a, &p);
   }
 
   // caches (tmpfs)
   for d in [".cache", ".npm", ".conda"] {
     let p = home.join(d);
-    check_dir(&mut a, &mut created_dirs, &p.display().to_string());
-    a.extend(["--tmpfs".into(), p.display().to_string()]);
+    check_dir(&mut a, &mut created_dirs, &p);
+    push_arg(&mut a, "--tmpfs");
+    push_path(&mut a, &p);
   }
-  a.extend(["--tmpfs".into(), "/tmp".into(), "--tmpfs".into(), "/var".into()]);
+  push_arg(&mut a, "--tmpfs");
+  push_path(&mut a, Path::new("/tmp"));
+  push_arg(&mut a, "--tmpfs");
+  push_path(&mut a, Path::new("/var"));
 
   // agent configs (rw)
-  let h = home.display().to_string();
-  check_dir(&mut a, &mut created_dirs, &format!("{}/.config", h));
-  check_dir(&mut a, &mut created_dirs, &format!("{}/.local", h));
-  check_dir(&mut a, &mut created_dirs, &format!("{}/.local/share", h));
-  if_exists_bind(&mut a, &creds.join(".claude"), &format!("{}/.claude", h), &mut created_dirs);
-  if_exists_bind(&mut a, &creds.join(".claude.json"), &format!("{}/.claude.json", h), &mut created_dirs);
-  if_exists_bind(&mut a, &creds.join(".codex"), &format!("{}/.codex", h), &mut created_dirs);
-  if_exists_bind(&mut a, &creds.join(".config/opencode"), &format!("{}/.config/opencode", h), &mut created_dirs);
-  if_exists_bind(
-    &mut a,
-    &creds.join(".local/share/opencode"),
-    &format!("{}/.local/share/opencode", h),
-    &mut created_dirs,
-  );
-  let gitconfig_dst = format!("{}/.gitconfig", h);
-  a.extend(["--ro-bind".into(), creds.join(".gitconfig").display().to_string(), gitconfig_dst]);
+  check_dir(&mut a, &mut created_dirs, &home.join(".config"));
+  check_dir(&mut a, &mut created_dirs, &home.join(".local"));
+  check_dir(&mut a, &mut created_dirs, &home.join(".local/share"));
+  if_exists_bind(&mut a, &creds.join(".claude"), &home.join(".claude"), &mut created_dirs);
+  if_exists_bind(&mut a, &creds.join(".claude.json"), &home.join(".claude.json"), &mut created_dirs);
+  if_exists_bind(&mut a, &creds.join(".codex"), &home.join(".codex"), &mut created_dirs);
+  if_exists_bind(&mut a, &creds.join(".config/opencode"), &home.join(".config/opencode"), &mut created_dirs);
+  if_exists_bind(&mut a, &creds.join(".local/share/opencode"), &home.join(".local/share/opencode"), &mut created_dirs);
+  push_arg(&mut a, "--ro-bind");
+  push_path(&mut a, &creds.join(".gitconfig"));
+  push_path(&mut a, &home.join(".gitconfig"));
 
   // workspace
-  check_dir(&mut a, &mut created_dirs, &code.display().to_string());
-  a.extend(["--bind".into(), sb.path.display().to_string(), code.display().to_string()]);
+  check_dir(&mut a, &mut created_dirs, &code);
+  push_arg(&mut a, "--bind");
+  push_path(&mut a, &sb.path);
+  push_path(&mut a, &code);
 
   // set so binary
   let so_dir = std::env::current_exe()
     .ok()
     .and_then(|p| p.parent().map(|p| p.to_path_buf()))
     .unwrap_or_else(|| PathBuf::from("/usr/local/bin"));
-  a.extend(["--ro-bind".into(), so_dir.display().to_string(), "/opt/so".into()]);
+  push_arg(&mut a, "--ro-bind");
+  push_path(&mut a, &so_dir);
+  push_path(&mut a, Path::new("/opt/so"));
 
   // docker socket
   if Path::new("/var/run/docker.sock").exists() {
-    a.extend(["--bind".into(), "/var/run/docker.sock".into(), "/var/run/docker.sock".into()]);
+    push_arg(&mut a, "--bind");
+    push_path(&mut a, Path::new("/var/run/docker.sock"));
+    push_path(&mut a, Path::new("/var/run/docker.sock"));
   }
-  if_exists_ro(&mut a, &home.join(".docker").display().to_string());
+  if_exists_ro(&mut a, &home.join(".docker"));
 
-  a.extend(["--dev".into(), "/dev".into(), "--proc".into(), "/proc".into(), "--unshare-pid".into()]);
+  push_arg(&mut a, "--dev");
+  push_path(&mut a, Path::new("/dev"));
+  push_arg(&mut a, "--proc");
+  push_path(&mut a, Path::new("/proc"));
+  push_arg(&mut a, "--unshare-pid");
 
   // PATH with conda
   let mut path = std::env::var("PATH").unwrap_or_default();
@@ -289,24 +319,46 @@ async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), E
   }
 
   // env
-  a.extend(["--setenv".into(), "HOME".into(), h.clone()]);
-  a.extend(["--setenv".into(), "PATH".into(), path]);
-  a.extend(["--setenv".into(), "CLAUDE_CODE_TASK_LIST_ID".into(), sb.task_id.clone()]);
-  a.extend(["--setenv".into(), "SO_UNATTENDED".into(), "1".into()]);
-  a.extend(["--setenv".into(), "TMPDIR".into(), "/tmp".into()]);
-  a.extend(["--setenv".into(), "UV_CACHE_DIR".into(), format!("{}/.cache/uv", h)]);
+  let h = home.display().to_string();
+  push_arg(&mut a, "--setenv");
+  push_arg(&mut a, "HOME");
+  push_arg(&mut a, &h);
+  push_arg(&mut a, "--setenv");
+  push_arg(&mut a, "PATH");
+  push_arg(&mut a, &path);
+  push_arg(&mut a, "--setenv");
+  push_arg(&mut a, "CLAUDE_CODE_TASK_LIST_ID");
+  push_arg(&mut a, &sb.task_id);
+  push_arg(&mut a, "--setenv");
+  push_arg(&mut a, "SO_UNATTENDED");
+  push_arg(&mut a, "1");
+  push_arg(&mut a, "--setenv");
+  push_arg(&mut a, "TMPDIR");
+  push_arg(&mut a, "/tmp");
+  push_arg(&mut a, "--setenv");
+  push_arg(&mut a, "UV_CACHE_DIR");
+  push_arg(&mut a, &format!("{}/.cache/uv", h));
   if let Ok(m) = std::env::var("MODEL") {
-    a.extend(["--setenv".into(), "MODEL".into(), m]);
+    push_arg(&mut a, "--setenv");
+    push_arg(&mut a, "MODEL");
+    push_arg(&mut a, &m);
   }
   if let Ok(e) = std::env::var("EFFORT") {
-    a.extend(["--setenv".into(), "EFFORT".into(), e]);
+    push_arg(&mut a, "--setenv");
+    push_arg(&mut a, "EFFORT");
+    push_arg(&mut a, &e);
   }
 
-  a.extend(["--chdir".into(), code.display().to_string()]);
-  a.extend(["--".into(), "/opt/so/so".into(), "step".into(), harness.into(), iterations.to_string()]);
+  push_arg(&mut a, "--chdir");
+  push_path(&mut a, &code);
+  push_arg(&mut a, "--");
+  push_arg(&mut a, "/opt/so/so");
+  push_arg(&mut a, "step");
+  push_arg(&mut a, harness);
+  push_arg(&mut a, &iterations.to_string());
 
   let mut cmd = Command::new("bwrap");
-  cmd.args(&a).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+  cmd.args(a.iter().map(|p| p.as_os_str())).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
   let child = match cmd.spawn() {
     Ok(c) => c,
     Err(e) => {
@@ -330,31 +382,44 @@ async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), E
 // Bwrap helpers
 // =============================================================================
 
-fn ro(a: &mut Vec<String>, p: &str) {
-  a.extend(["--ro-bind".into(), p.into(), p.into()]);
+fn push_arg(a: &mut Vec<OsString>, s: &str) {
+  a.push(OsString::from(s));
 }
 
-fn if_exists_ro(a: &mut Vec<String>, p: &str) {
-  if Path::new(p).exists() {
+fn push_path(a: &mut Vec<OsString>, p: &Path) {
+  a.push(p.as_os_str().to_os_string());
+}
+
+fn ro(a: &mut Vec<OsString>, p: &Path) {
+  push_arg(a, "--ro-bind");
+  push_path(a, p);
+  push_path(a, p);
+}
+
+fn if_exists_ro(a: &mut Vec<OsString>, p: &Path) {
+  if p.exists() {
     ro(a, p);
   }
 }
 
-fn if_exists_bind(a: &mut Vec<String>, src: &Path, dst: &str, created_dirs: &mut HashSet<String>) {
+fn if_exists_bind(a: &mut Vec<OsString>, src: &Path, dst: &Path, created_dirs: &mut HashSet<PathBuf>) {
   if src.exists() {
-    if let Some(parent) = Path::new(dst).parent() {
-      check_dir(a, created_dirs, &parent.display().to_string());
+    if let Some(parent) = dst.parent() {
+      check_dir(a, created_dirs, parent);
     }
     if src.is_dir() {
       check_dir(a, created_dirs, dst);
     }
-    a.extend(["--bind".into(), src.display().to_string(), dst.into()]);
+    push_arg(a, "--bind");
+    push_path(a, src);
+    push_path(a, dst);
   }
 }
 
-fn check_dir(a: &mut Vec<String>, created: &mut HashSet<String>, path: &str) {
-  if created.insert(path.to_string()) {
-    a.extend(["--dir".into(), path.into()]);
+fn check_dir(a: &mut Vec<OsString>, created: &mut HashSet<PathBuf>, path: &Path) {
+  if created.insert(path.to_path_buf()) {
+    push_arg(a, "--dir");
+    push_path(a, path);
   }
 }
 
