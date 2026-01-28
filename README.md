@@ -36,7 +36,7 @@ brew install --cask docker
 
 Linux:
 
-- Refer to the install guide from [Docker](https://docs.docker.com/engine/install/)
+- Refer to the install guide from [docker](https://docs.docker.com/engine/install/)
 
 ## Usage
 
