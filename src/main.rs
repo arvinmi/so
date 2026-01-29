@@ -9,13 +9,17 @@ use std::{
   time::{Duration, Instant},
 };
 
-use clap::{Parser, Subcommand};
+use clap::{
+  Parser, Subcommand, ValueEnum,
+  builder::{Styles, styling::AnsiColor},
+};
 use colored::Colorize;
 use thiserror::Error;
 use tokio::process::Command;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum Harness {
+  #[default]
   Claude,
   Opencode,
   Codex,
@@ -31,24 +35,9 @@ impl Harness {
   }
 }
 
-impl std::str::FromStr for Harness {
-  type Err = Error;
-
-  fn from_str(s: &str) -> Result<Self, Self::Err> {
-    if s.eq_ignore_ascii_case("claude") {
-      Ok(Harness::Claude)
-    } else if s.eq_ignore_ascii_case("opencode") {
-      Ok(Harness::Opencode)
-    } else if s.eq_ignore_ascii_case("codex") {
-      Ok(Harness::Codex)
-    } else {
-      Err(Error::InvalidHarness(s.into()))
-    }
-  }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum SandboxType {
+  #[default]
   Docker,
   Bwrap,
 }
@@ -58,20 +47,6 @@ impl SandboxType {
     match self {
       SandboxType::Docker => "docker",
       SandboxType::Bwrap => "bwrap",
-    }
-  }
-}
-
-impl std::str::FromStr for SandboxType {
-  type Err = Error;
-
-  fn from_str(s: &str) -> Result<Self, Self::Err> {
-    if s.eq_ignore_ascii_case("docker") {
-      Ok(SandboxType::Docker)
-    } else if s.eq_ignore_ascii_case("bwrap") {
-      Ok(SandboxType::Bwrap)
-    } else {
-      Err(Error::InvalidSandbox(s.into()))
     }
   }
 }
@@ -98,10 +73,6 @@ pub enum Error {
   NoDockerfile,
   #[error("cannot determine home directory")]
   NoHome,
-  #[error("unknown harness `{0}`, use: claude, opencode, codex")]
-  InvalidHarness(String),
-  #[error("unknown sandbox `{0}`, use: docker, bwrap")]
-  InvalidSandbox(String),
   #[error("interrupted")]
   Interrupted,
   #[error("{0}")]
@@ -112,58 +83,57 @@ pub enum Error {
 // So
 // =============================================================================
 
+const STYLES: Styles = Styles::plain().header(AnsiColor::White.on_default().underline());
+
 #[derive(Parser)]
-#[command(name = "so", about = "Sandbox for your agents")]
+#[command(
+  name = "so",
+  about = "Sandbox orchestrator for your agents",
+  version,
+  styles = STYLES,
+  after_help = "Run 'so <command> --help' for more information on a specific command."
+)]
 struct Cli {
+  /// Agent harness to use
+  #[arg(short = 'H', long, global = true, default_value = "claude", value_enum)]
+  harness: Harness,
+
+  /// Number of iterations
+  #[arg(short = 'n', long, global = true, default_value = "10")]
+  iterations: u32,
+
+  /// Model override
+  #[arg(short, long, global = true)]
+  model: Option<String>,
+
+  /// Effort level for reasoning
+  #[arg(short, long, global = true)]
+  effort: Option<String>,
+
+  /// Sandbox type
+  #[arg(short, long, global = true, env = "SANDBOX", default_value = "docker", value_enum)]
+  sandbox: SandboxType,
+
   #[command(subcommand)]
   command: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
+  /// Unattended, continuous execution
+  Run,
   /// Attended, human-in-the-loop
-  Step {
-    #[arg(default_value = "claude")]
-    first: String,
-    second: Option<u32>,
-  },
-  /// Unattended, continuous
-  Run {
-    #[arg(default_value = "claude")]
-    first: String,
-    second: Option<u32>,
-  },
-  /// Generate your plan
-  Plan {
-    #[arg(default_value = "claude")]
-    harness: String,
-  },
+  Step,
+  /// Generate implementation plan and specs
+  Plan,
   /// Fix code smells
-  Clean {
-    #[arg(default_value = "claude")]
-    first: String,
-    second: Option<u32>,
-  },
-  /// Remove duplicates
-  Dup {
-    #[arg(default_value = "claude")]
-    first: String,
-    second: Option<u32>,
-  },
+  Clean,
+  /// Remove duplicate code
+  Dup,
   /// Guided learning
-  Learn {
-    #[arg(default_value = "claude")]
-    harness: String,
-  },
-  /// Manage sandboxes
+  Learn,
+  /// Manage existing sandboxes
   Menu,
-}
-
-fn parse_args(first: &str, second: Option<u32>, default: u32) -> Result<(Harness, u32), Error> {
-  match first.parse::<u32>() {
-    Ok(n) => Ok((Harness::Claude, n)),
-    Err(_) => Ok((first.parse::<Harness>()?, second.unwrap_or(default))),
-  }
 }
 
 // =============================================================================
@@ -197,26 +167,27 @@ async fn main() {
 
 async fn run() -> Result<(), Error> {
   let cli = Cli::parse();
+  let h = cli.harness;
+  let model = cli.model;
+  let effort = cli.effort;
+  let st = cli.sandbox;
+
+  // set env vars for harness runners
+  if let Some(m) = &model {
+    unsafe { std::env::set_var("MODEL", m) };
+  }
+  if let Some(e) = &effort {
+    unsafe { std::env::set_var("EFFORT", e) };
+  }
+
   match cli.command.unwrap_or(Cmd::Menu) {
-    Cmd::Step { first, second } => {
-      let (h, n) = parse_args(&first, second, 1)?;
-      do_step(h, n).await
-    }
-    Cmd::Run { first, second } => {
-      let (h, n) = parse_args(&first, second, 10)?;
-      do_run(h, n).await
-    }
-    Cmd::Plan { harness } => do_plan(harness.parse()?).await,
-    Cmd::Clean { first, second } => {
-      let (h, n) = parse_args(&first, second, 10)?;
-      do_clean(h, n).await
-    }
-    Cmd::Dup { first, second } => {
-      let (h, n) = parse_args(&first, second, 10)?;
-      do_dup(h, n).await
-    }
+    Cmd::Run => do_run(h, cli.iterations, st).await,
+    Cmd::Step => do_step(h, cli.iterations).await,
+    Cmd::Plan => do_plan(h).await,
+    Cmd::Clean => do_clean(h, cli.iterations, st).await,
+    Cmd::Dup => do_dup(h, cli.iterations, st).await,
+    Cmd::Learn => do_learn(h).await,
     Cmd::Menu => do_menu().await,
-    Cmd::Learn { harness } => do_learn(harness.parse()?).await,
   }
 }
 
@@ -227,10 +198,10 @@ async fn run() -> Result<(), Error> {
 fn validate_sandbox(st: SandboxType) -> Result<(), Error> {
   if st == SandboxType::Bwrap {
     if cfg!(target_os = "macos") {
-      return Err(Error::Other("bwrap not available on macOS, use SANDBOX=docker".into()));
+      return Err(Error::Other("bubblewrap not available on macOS, use --sandbox docker".into()));
     }
     if std::process::Command::new("bwrap").arg("--version").output().is_err() {
-      return Err(Error::Other("bwrap not installed, run `sudo apt install bubblewrap`".into()));
+      return Err(Error::Other("bubblewrap not installed, run `sudo apt install bubblewrap`".into()));
     }
   } else {
     if std::process::Command::new("docker").arg("--version").output().is_err() {
@@ -241,10 +212,6 @@ fn validate_sandbox(st: SandboxType) -> Result<(), Error> {
     }
   }
   Ok(())
-}
-
-fn sandbox_type() -> Result<SandboxType, Error> {
-  std::env::var("SANDBOX").unwrap_or_else(|_| "docker".into()).parse()
 }
 
 // =============================================================================
@@ -275,8 +242,7 @@ async fn do_step(harness: Harness, iterations: u32) -> Result<(), Error> {
   Ok(())
 }
 
-async fn do_run(harness: Harness, iterations: u32) -> Result<(), Error> {
-  let st = sandbox_type()?;
+async fn do_run(harness: Harness, iterations: u32, st: SandboxType) -> Result<(), Error> {
   validate_sandbox(st)?;
   let cwd = std::env::current_dir()?;
 
@@ -297,7 +263,7 @@ async fn do_run(harness: Harness, iterations: u32) -> Result<(), Error> {
   finalize_sandbox(&sb, harness, effective_max, &cwd, start).await
 }
 
-async fn do_clean(harness: Harness, iterations: u32) -> Result<(), Error> {
+async fn do_clean(harness: Harness, iterations: u32, st: SandboxType) -> Result<(), Error> {
   let prompt = r#"Ignore any existing specs/ files.
 
 Review codebase super carefully with fresh eyes. Look for:
@@ -308,21 +274,26 @@ Review codebase super carefully with fresh eyes. Look for:
 Fix one issue per iteration.
 Commit: "clean: <description>"
 When nothing left, set specs/status.md to "Status: done""#;
-  run_with_prompt(harness, iterations, prompt, sandbox::Mode::Clean).await
+  run_with_prompt(harness, iterations, prompt, sandbox::Mode::Clean, st).await
 }
 
-async fn do_dup(harness: Harness, iterations: u32) -> Result<(), Error> {
+async fn do_dup(harness: Harness, iterations: u32, st: SandboxType) -> Result<(), Error> {
   let prompt = r#"Ignore any existing specs/ files.
 Run jscpd.
 Pick one duplicate from the report.
 Refactor into shared utility.
 Commit: "dry: <utility name>"
 When nothing left, set specs/status.md to "Status: done""#;
-  run_with_prompt(harness, iterations, prompt, sandbox::Mode::Dup).await
+  run_with_prompt(harness, iterations, prompt, sandbox::Mode::Dup, st).await
 }
 
-async fn run_with_prompt(harness: Harness, iterations: u32, prompt: &str, mode: sandbox::Mode) -> Result<(), Error> {
-  let st = sandbox_type()?;
+async fn run_with_prompt(
+  harness: Harness,
+  iterations: u32,
+  prompt: &str,
+  mode: sandbox::Mode,
+  st: SandboxType,
+) -> Result<(), Error> {
   validate_sandbox(st)?;
   let cwd = std::env::current_dir()?;
 

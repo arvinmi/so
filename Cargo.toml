@@ -11,7 +11,7 @@ keywords = ["cli", "agent"]
 categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
