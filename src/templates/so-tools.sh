@@ -21,7 +21,9 @@ $SUDO apt-get install -y --no-install-recommends ripgrep jq git
 
 # install node for opencode, codex, and claude code (as root)
 echo "installing node..."
-curl -fsSL https://deb.nodesource.com/setup_lts.x | $SUDO bash -
+curl -fsSL https://deb.nodesource.com/setup_lts.x -o /tmp/node-setup.sh
+$SUDO bash /tmp/node-setup.sh
+rm -f /tmp/node-setup.sh
 $SUDO apt-get install -y nodejs
 $SUDO rm -rf /var/lib/apt/lists/*
 

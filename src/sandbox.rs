@@ -147,7 +147,12 @@ async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), 
   let creds = setup_creds()?;
 
   let mut cmd = Command::new("docker");
-  cmd.args(["run", "-it", "--rm", "--network", "host"]);
+  // use -t only if we have a real tty, otherwise just -i for stdin
+  if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    cmd.args(["run", "-it", "--rm", "--network", "host"]);
+  } else {
+    cmd.args(["run", "-i", "--rm", "--network", "host"]);
+  }
 
   // pass gpu if available (linux only)
   if cfg!(target_os = "linux") {
@@ -185,7 +190,7 @@ async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), 
   }
 
   cmd.args(["-w", &code]).arg(&image);
-  cmd.args(["/opt/so/so", "step", harness, &iterations.to_string()]);
+  cmd.args(["/opt/so/so", "-H", harness, "step", "-n", &iterations.to_string()]);
   cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
 
   let child = match cmd.spawn() {
@@ -247,12 +252,15 @@ async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), E
     if_exists_ro(&mut a, &home.join(d));
   }
 
-  // writable tool dirs (tmpfs)
-  for d in [".local", ".bun"] {
-    let p = home.join(d);
+  // writable tool dirs (tmpfs with optional ro overlays)
+  for (dir, ro_subs) in [(".bun", &[] as &[&str]), (".local", &["bin", "share"])] {
+    let p = home.join(dir);
     check_dir(&mut a, &mut created_dirs, &p);
     push_arg(&mut a, "--tmpfs");
     push_path(&mut a, &p);
+    for sub in ro_subs {
+      if_exists_ro(&mut a, &p.join(sub));
+    }
   }
 
   // caches (tmpfs)
@@ -353,8 +361,10 @@ async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), E
   push_path(&mut a, &code);
   push_arg(&mut a, "--");
   push_arg(&mut a, "/opt/so/so");
-  push_arg(&mut a, "step");
+  push_arg(&mut a, "-H");
   push_arg(&mut a, harness);
+  push_arg(&mut a, "step");
+  push_arg(&mut a, "-n");
   push_arg(&mut a, &iterations.to_string());
 
   let mut cmd = Command::new("bwrap");
