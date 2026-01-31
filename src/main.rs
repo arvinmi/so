@@ -14,6 +14,7 @@ use clap::{
   builder::{Styles, styling::AnsiColor},
 };
 use colored::Colorize;
+use sandbox::SandboxType;
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -31,22 +32,6 @@ impl Harness {
       Harness::Claude => "claude",
       Harness::Opencode => "opencode",
       Harness::Codex => "codex",
-    }
-  }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
-enum SandboxType {
-  #[default]
-  Docker,
-  Bwrap,
-}
-
-impl SandboxType {
-  fn as_str(self) -> &'static str {
-    match self {
-      SandboxType::Docker => "docker",
-      SandboxType::Bwrap => "bwrap",
     }
   }
 }
@@ -260,7 +245,7 @@ async fn do_run(harness: Harness, iterations: u32, st: SandboxType) -> Result<()
   let start = Instant::now();
   let effective_max = effective_max(&sb.path, iterations);
   print_sandbox_start(harness, effective_max, st, &sb.task_id);
-  finalize_sandbox(&sb, harness, effective_max, &cwd, start).await
+  finalize_sandbox(&sb, harness, effective_max, &cwd, start, st).await
 }
 
 async fn do_clean(harness: Harness, iterations: u32, st: SandboxType) -> Result<(), Error> {
@@ -312,7 +297,7 @@ async fn run_with_prompt(
 
   let start = Instant::now();
   print_sandbox_start(harness, iterations, st, &sb.task_id);
-  finalize_sandbox(&sb, harness, iterations, &cwd, start).await
+  finalize_sandbox(&sb, harness, iterations, &cwd, start, st).await
 }
 
 async fn do_plan(harness: Harness) -> Result<(), Error> {
@@ -371,7 +356,6 @@ Start by asking what I want to learn."#;
 }
 
 async fn do_menu() -> Result<(), Error> {
-  let cwd = std::env::current_dir()?;
   loop {
     let sandboxes = sandbox::list()?;
     if sandboxes.is_empty() {
@@ -512,7 +496,7 @@ async fn do_menu() -> Result<(), Error> {
       let base = sandbox::git_base(&sb.path, sandbox::BASE_TAG);
       println!();
       print_summary(&sandbox::git_stat(&sb.path, &base), None, Some(&sb.path.display().to_string()));
-      run_menu(&sb.path, &base, &cwd, &branch).await?;
+      run_menu(&sb.path, &base, &sb.original, &branch).await?;
       return Ok(());
     }
     eprintln!("{} invalid choice", "error:".red().bold());
@@ -753,8 +737,9 @@ async fn finalize_sandbox(
   iterations: u32,
   cwd: &Path,
   start: Instant,
+  st: SandboxType,
 ) -> Result<(), Error> {
-  let result = sandbox::run(sb, harness.as_str(), iterations).await;
+  let result = sandbox::run(sb, harness.as_str(), iterations, st).await;
   match result {
     Ok(()) => {
       println!();
@@ -771,12 +756,6 @@ async fn finalize_sandbox(
       Ok(())
     }
     Err(e) => {
-      println!();
-      print_summary(
-        &sandbox::git_stat(&sb.path, sandbox::BASE_TAG),
-        Some(&fmt_time(start.elapsed())),
-        Some(&sb.path.display().to_string()),
-      );
       let _ = std::fs::remove_dir_all(&sb.path);
       Err(e)
     }

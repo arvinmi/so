@@ -16,10 +16,19 @@ use crate::Error;
 
 pub const BASE_TAG: &str = "so-base";
 
-fn is_bwrap() -> bool {
-  match std::env::var("SANDBOX") {
-    Ok(v) => v.eq_ignore_ascii_case("bwrap"),
-    Err(_) => false,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum SandboxType {
+  #[default]
+  Docker,
+  Bwrap,
+}
+
+impl SandboxType {
+  pub fn as_str(self) -> &'static str {
+    match self {
+      SandboxType::Docker => "docker",
+      SandboxType::Bwrap => "bwrap",
+    }
   }
 }
 
@@ -53,7 +62,7 @@ impl Sandbox {
     let task_id = format!("so-{}-{}", project, ts);
 
     copy_dir(original, &path)?;
-    let branch = setup_git(&path)?;
+    let branch = setup_git(&path, original)?;
     setup_specs(&path, prompt, mode)?;
 
     Ok(Self { path, original: original.to_path_buf(), branch, task_id })
@@ -63,6 +72,7 @@ impl Sandbox {
 pub struct Info {
   pub name: String,
   pub path: PathBuf,
+  pub original: PathBuf,
   pub created: std::time::SystemTime,
   pub status: String,
 }
@@ -103,7 +113,13 @@ pub fn list() -> Result<Vec<Info>, Error> {
       } else {
         "pending"
       };
-      out.push(Info { name, path, created, status: status.into() });
+      let original = Repository::open(&path)
+        .ok()
+        .and_then(|r| r.config().ok())
+        .and_then(|c| c.get_string("so.original").ok())
+        .map(|s| PathBuf::from(s.trim()))
+        .unwrap_or_else(|| PathBuf::from("."));
+      out.push(Info { name, path, original, created, status: status.into() });
     }
   }
   out.sort_by(|a, b| b.created.cmp(&a.created));
@@ -114,8 +130,11 @@ pub fn list() -> Result<Vec<Info>, Error> {
 // Run
 // =============================================================================
 
-pub async fn run(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), Error> {
-  if is_bwrap() { run_bwrap(sb, harness, iterations).await } else { run_docker(sb, harness, iterations).await }
+pub async fn run(sb: &Sandbox, harness: &str, iterations: u32, st: SandboxType) -> Result<(), Error> {
+  match st {
+    SandboxType::Bwrap => run_bwrap(sb, harness, iterations).await,
+    SandboxType::Docker => run_docker(sb, harness, iterations).await,
+  }
 }
 
 async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), Error> {
@@ -125,8 +144,8 @@ async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), 
     return Err(Error::NoDockerfile);
   }
 
-  let user = dockerfile_user(&dockerfile).unwrap_or_else(|| "so".into());
-  let home = format!("/home/{}", user);
+  // use `/home/ubuntu` to closly match host config
+  let home = "/home/ubuntu".to_string();
   let code = format!("{}/{}", home, project);
   let image = format!("sandbox-{}", project.to_lowercase());
 
@@ -155,13 +174,12 @@ async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), 
   }
 
   // pass gpu if available (linux only)
-  if cfg!(target_os = "linux") {
-    if has_gpu() {
-      cmd.args(["--gpus", "all"]);
-    } else {
-      eprintln!("{} no GPU detected, running without GPU support", "note:".cyan().bold());
-    }
+  if cfg!(target_os = "linux") && has_gpu() {
+    cmd.args(["--gpus", "all"]);
   }
+
+  // run as host user for credential file access
+  cmd.arg("--user").arg(format!("{}:{}", get_uid(), get_gid()));
 
   // mounts
   cmd.args(["-v", "/etc/localtime:/etc/localtime:ro"]);
@@ -446,6 +464,13 @@ fn has_gpu() -> bool {
     .unwrap_or(false)
 }
 
+fn get_uid() -> u32 {
+  unsafe { libc::getuid() }
+}
+fn get_gid() -> u32 {
+  unsafe { libc::getgid() }
+}
+
 async fn needs_rebuild(image: &str, dockerfile: &Path) -> bool {
   let img = Command::new("docker")
     .args(["inspect", "-f", "{{.Created}}", image])
@@ -460,16 +485,6 @@ async fn needs_rebuild(image: &str, dockerfile: &Path) -> bool {
     .and_then(|m| m.modified().ok())
     .map(|t| chrono::DateTime::<chrono::Utc>::from(t).format("%Y%m%d").to_string().parse::<u32>().unwrap_or(0));
   img.is_none() || file.unwrap_or(0) >= img.unwrap_or(0)
-}
-
-fn dockerfile_user(p: &Path) -> Option<String> {
-  std::fs::read_to_string(p)
-    .ok()?
-    .lines()
-    .rev()
-    .find(|l| l.trim().starts_with("USER "))
-    .and_then(|l| l.split_whitespace().nth(1))
-    .map(|s| s.into())
 }
 
 fn mount_creds(cmd: &mut Command, creds: &Path, home: &str) {
@@ -560,7 +575,7 @@ fn copy_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<(), Error> 
 // Git setup
 // =============================================================================
 
-fn setup_git(sandbox: &Path) -> Result<String, Error> {
+fn setup_git(sandbox: &Path, original: &Path) -> Result<String, Error> {
   let repo = Repository::open(sandbox)?;
   let branch = repo.head()?.shorthand().unwrap_or("main").to_string();
   let sb_branch = format!("sandbox/{}", branch);
@@ -584,7 +599,9 @@ fn setup_git(sandbox: &Path) -> Result<String, Error> {
   }
 
   repo.tag_lightweight(BASE_TAG, &commit.into_object(), true)?;
-  repo.config()?.set_str("receive.denyCurrentBranch", "updateInstead")?;
+  let mut cfg = repo.config()?;
+  cfg.set_str("receive.denyCurrentBranch", "updateInstead")?;
+  cfg.set_str("so.original", &original.display().to_string())?;
 
   Ok(sb_branch)
 }
