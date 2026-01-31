@@ -72,40 +72,40 @@ so run
 Choose a harness and iterations:
 
 ```bash
-so run claude 5
-so run codex 3
-so run opencode 2
+so run -H claude -i 5
+so run -H codex -i 3
+so run -H opencode -i 2
 ```
 
 Iterations only (defaults to claude):
 
 ```bash
-so run 5
+so run -i 5
 ```
 
 Use docker explicitly:
 
 ```bash
-SANDBOX=docker so run
+so run -s docker
 ```
 
 Use bubblewrap:
 
 ```bash
-SANDBOX=bwrap so run
+so run -s bwrap
 ```
 
 ## Commands
 
-| Command | Description                |
-| ------- | -------------------------- |
-| `plan`  | Generate specs/prompt.md   |
-| `run`   | Run agent in sandbox       |
-| `step`  | Run with human-in-the-loop |
-| `clean` | Fix code smells            |
-| `dup`   | Remove duplicates          |
-| `learn` | Guided learning session    |
-| `menu`  | Manage existing sandboxes  |
+| Command | Description                            |
+| ------- | -------------------------------------- |
+| `plan`  | Generate implementation plan and specs |
+| `run`   | Run agent in sandbox                   |
+| `step`  | Run with human-in-the-loop             |
+| `clean` | Fix code smells                        |
+| `dup`   | Remove duplicate code                  |
+| `learn` | Guided learning session                |
+| `menu`  | Manage existing sandboxes              |
 
 ## Workflow
 
@@ -115,16 +115,20 @@ SANDBOX=bwrap so run
 4. Review changes with diff, shell into sandbox, reset and pick commit
 5. Merge when satisfied and changes are squashed into your codebase
 
-## Environment
+## Options
 
-| Variable  | Default  | Description     |
-| --------- | -------- | --------------- |
-| `SANDBOX` | `docker` | bwrap or docker |
-| `MODEL`   | -        | Model override  |
-| `EFFORT`  | -        | Effort override |
+| Flag               | Default  | Description                    |
+| ------------------ | -------- | ------------------------------ |
+| `-H, --harness`    | `claude` | Agent: claude, opencode, codex |
+| `-i, --iterations` | `10`     | Number of iterations           |
+| `-s, --sandbox`    | `docker` | Sandbox type: docker, bwrap    |
+| `-m, --model`      | -        | Model override                 |
+| `-e, --effort`     | -        | Effort level for reasoning     |
 
 Set model and effort:
 
 ```bash
-MODEL=openai/gpt-5.2-codex EFFORT=medium so run opencode
+so run -H opencode -m openai/gpt-5.2-codex -e medium
 ```
+
+> Note: Setting `SANDBOX` as an environment variable is the same as `--sandbox`.
