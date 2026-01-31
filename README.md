@@ -15,7 +15,7 @@ Run coding agents in isolated sandboxes so they can't break your host. Changes s
 ## Installation
 
 ```bash
-cargo install so
+cargo install sono
 ```
 
 ### Requirements

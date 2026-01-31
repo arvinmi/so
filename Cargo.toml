@@ -1,5 +1,5 @@
 [package]
-name = "so"
+name = "sono"
 version = "0.1.0"
 edition = "2024"
 description = "Sandbox for your agents"
@@ -9,6 +9,10 @@ repository = "https://github.com/arvinmi/so"
 readme = "README.md"
 keywords = ["cli", "agent"]
 categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "so"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
