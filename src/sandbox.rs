@@ -149,18 +149,18 @@ async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), 
   let code = format!("{}/{}", home, project);
   let image = format!("sandbox-{}", project.to_lowercase());
 
-  // rebuild if dockerfile newer than image
-  let rebuild = needs_rebuild(&image, &dockerfile).await;
-  println!("{}", "▶ Building image".yellow().bold());
-  let mut cmd = Command::new("docker");
-  cmd.args(["build", "-q"]);
-  if rebuild {
-    cmd.arg("--no-cache");
-  }
-  cmd.args(["-t", &image, "-f"]).arg(&dockerfile).arg(&sb.original);
-  cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-  if !cmd.status().await?.success() {
-    return Err(Error::Docker("build failed".into()));
+  // rebuild image if dockerfile changed
+  if image_is_fresh(&image, &dockerfile).await {
+    println!("{}", "▶ Using cached image".yellow().bold());
+  } else {
+    println!("{}", "▶ Building image".yellow().bold());
+    let mut cmd = Command::new("docker");
+    cmd.args(["build", "-q"]);
+    cmd.args(["-t", &image, "-f"]).arg(&dockerfile).arg(&sb.original);
+    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    if !cmd.status().await?.success() {
+      return Err(Error::Docker("build failed".into()));
+    }
   }
 
   let creds = setup_creds()?;
@@ -200,6 +200,9 @@ async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), 
   // env
   cmd.args(["-e", &format!("CLAUDE_CODE_TASK_LIST_ID={}", sb.task_id)]);
   cmd.args(["-e", "SO_UNATTENDED=1"]);
+  cmd.args(["-e", &format!("HOME={}", home)]);
+  cmd.args(["-e", &format!("XDG_CONFIG_HOME={}/.config", home)]);
+  cmd.args(["-e", &format!("XDG_DATA_HOME={}/.local/share", home)]);
   if let Ok(m) = std::env::var("MODEL") {
     cmd.args(["-e", &format!("MODEL={}", m)]);
   }
@@ -208,7 +211,7 @@ async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), 
   }
 
   cmd.args(["-w", &code]).arg(&image);
-  cmd.args(["/opt/so/so", "-H", harness, "step", "-n", &iterations.to_string()]);
+  cmd.args(["/opt/so/so", "-H", harness, "step", "-i", &iterations.to_string()]);
   cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
 
   let child = match cmd.spawn() {
@@ -382,7 +385,7 @@ async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), E
   push_arg(&mut a, "-H");
   push_arg(&mut a, harness);
   push_arg(&mut a, "step");
-  push_arg(&mut a, "-n");
+  push_arg(&mut a, "-i");
   push_arg(&mut a, &iterations.to_string());
 
   let mut cmd = Command::new("bwrap");
@@ -471,20 +474,21 @@ fn get_gid() -> u32 {
   unsafe { libc::getgid() }
 }
 
-async fn needs_rebuild(image: &str, dockerfile: &Path) -> bool {
-  let img = Command::new("docker")
+async fn image_is_fresh(image: &str, dockerfile: &Path) -> bool {
+  let created = Command::new("docker")
     .args(["inspect", "-f", "{{.Created}}", image])
     .output()
     .await
     .ok()
     .and_then(|o| String::from_utf8(o.stdout).ok())
-    .and_then(|s| s.split('T').next().map(|d| d.replace('-', "")))
-    .and_then(|s| s.trim().parse::<u32>().ok());
-  let file = std::fs::metadata(dockerfile)
-    .ok()
-    .and_then(|m| m.modified().ok())
-    .map(|t| chrono::DateTime::<chrono::Utc>::from(t).format("%Y%m%d").to_string().parse::<u32>().unwrap_or(0));
-  img.is_none() || file.unwrap_or(0) >= img.unwrap_or(0)
+    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+    .map(|dt| dt.with_timezone(&chrono::Utc));
+  let modified =
+    std::fs::metadata(dockerfile).ok().and_then(|m| m.modified().ok()).map(chrono::DateTime::<chrono::Utc>::from);
+  match (created, modified) {
+    (Some(c), Some(m)) => c >= m,
+    _ => false,
+  }
 }
 
 fn mount_creds(cmd: &mut Command, creds: &Path, home: &str) {

@@ -14,6 +14,7 @@ use clap::{
   builder::{Styles, styling::AnsiColor},
 };
 use colored::Colorize;
+use git2::Repository;
 use sandbox::SandboxType;
 use thiserror::Error;
 use tokio::process::Command;
@@ -84,7 +85,7 @@ struct Cli {
   harness: Harness,
 
   /// Number of iterations
-  #[arg(short = 'n', long, global = true, default_value = "10")]
+  #[arg(short = 'i', long, global = true, default_value = "10")]
   iterations: u32,
 
   /// Model override
@@ -188,6 +189,9 @@ fn validate_sandbox(st: SandboxType) -> Result<(), Error> {
     if std::process::Command::new("bwrap").arg("--version").output().is_err() {
       return Err(Error::Other("bubblewrap not installed, run `sudo apt install bubblewrap`".into()));
     }
+    if needs_bwrap_apparmor() {
+      return Err(Error::Other("bwrap blocked by apparmor restriction".into()));
+    }
   } else {
     if std::process::Command::new("docker").arg("--version").output().is_err() {
       return Err(Error::Other("docker not installed".into()));
@@ -197,6 +201,23 @@ fn validate_sandbox(st: SandboxType) -> Result<(), Error> {
     }
   }
   Ok(())
+}
+
+// check for apparmor restriction on bwrap (ubuntu 24.04+)
+fn needs_bwrap_apparmor() -> bool {
+  if !cfg!(target_os = "linux") {
+    return false;
+  }
+  let restricted = std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+    .map(|v| v.trim() == "1")
+    .unwrap_or(false);
+  if !restricted {
+    return false;
+  }
+  let profile_loaded = std::fs::read_to_string("/sys/kernel/security/apparmor/profiles")
+    .map(|profiles| profiles.lines().any(|l| l.starts_with("bwrap ")))
+    .unwrap_or(false);
+  !profile_loaded
 }
 
 // =============================================================================
@@ -240,6 +261,7 @@ async fn do_run(harness: Harness, iterations: u32, st: SandboxType) -> Result<()
 
   print_info(&format!("Creating sandbox (run) [{}]", st.as_str()));
   let sb = sandbox::Sandbox::new(&cwd, sandbox::Mode::Run, None)?;
+  set_mdata(&sb.path, harness, st, &sb.task_id)?;
   println!("  {}", sb.path.display().to_string().dimmed());
 
   let start = Instant::now();
@@ -293,6 +315,7 @@ async fn run_with_prompt(
   };
   print_info(&format!("Creating sandbox ({}) [{}]", mode_name, st.as_str()));
   let sb = sandbox::Sandbox::new(&cwd, mode, Some(prompt))?;
+  set_mdata(&sb.path, harness, st, &sb.task_id)?;
   println!("  {}", sb.path.display().to_string().dimmed());
 
   let start = Instant::now();
@@ -701,7 +724,7 @@ async fn enforce_commit(harness: Harness, cwd: &Path) {
     if !sandbox::git_dirty(cwd).unwrap_or(false) {
       return;
     }
-    eprintln!("\n{} uncommitted changes, you must commit ({}/3)\n", "warning:".yellow().bold(), i);
+    eprintln!("\n{} uncommitted changes ({}/3)\n", "warning:".yellow().bold(), i);
     if run_harness(harness, msg, RunMode::Run, TaskMode::Code, cwd).await.is_err() {
       break;
     }
@@ -717,7 +740,22 @@ fn check_status(cwd: &Path) -> Result<bool, Error> {
     return Ok(false);
   }
   let c = std::fs::read_to_string(&p)?.to_lowercase();
-  Ok(c.contains("status: done") || c.contains("status: blocked"))
+  Ok(c.contains("status: done"))
+}
+
+fn read_status(cwd: &Path) -> Option<String> {
+  let p = cwd.join("specs/status.md");
+  std::fs::read_to_string(&p).ok().map(|s| s.trim().to_string())
+}
+
+fn is_done(status: &str) -> bool {
+  let s = status.to_lowercase();
+  s.contains("status: done")
+}
+
+fn set_status_pending(cwd: &Path) -> Result<(), Error> {
+  std::fs::write(cwd.join("specs/status.md"), "Status: pending\n")?;
+  Ok(())
 }
 
 fn write_if_missing(path: &Path, content: &str) -> Result<(), Error> {
@@ -739,9 +777,8 @@ async fn finalize_sandbox(
   start: Instant,
   st: SandboxType,
 ) -> Result<(), Error> {
-  let result = sandbox::run(sb, harness.as_str(), iterations, st).await;
-  match result {
-    Ok(()) => {
+  match run_sandbox_iterations(sb, harness, iterations, st).await {
+    Ok(RunOutcome::Completed) => {
       println!();
       print_summary(
         &sandbox::git_stat(&sb.path, sandbox::BASE_TAG),
@@ -751,7 +788,7 @@ async fn finalize_sandbox(
       run_menu(&sb.path, sandbox::BASE_TAG, cwd, &sb.branch).await?;
       Ok(())
     }
-    Err(Error::Interrupted) => {
+    Ok(RunOutcome::Interrupted) => {
       println!("\n{}", format!("Interrupted. Sandbox kept at: {}", sb.path.display()).yellow());
       Ok(())
     }
@@ -790,6 +827,68 @@ fn run_git(args: &[&str], cwd: &Path) -> bool {
   }
 }
 
+enum RunOutcome {
+  Completed,
+  Interrupted,
+}
+
+async fn run_sandbox_iterations(
+  sb: &sandbox::Sandbox,
+  harness: Harness,
+  iterations: u32,
+  st: SandboxType,
+) -> Result<RunOutcome, Error> {
+  match sandbox::run(sb, harness.as_str(), iterations, st).await {
+    Ok(()) => Ok(RunOutcome::Completed),
+    Err(Error::Interrupted) => Ok(RunOutcome::Interrupted),
+    Err(e) => Err(e),
+  }
+}
+
+struct Mdata {
+  harness: Harness,
+  sandbox: SandboxType,
+  task_id: String,
+}
+
+fn set_mdata(path: &Path, harness: Harness, sandbox: SandboxType, task_id: &str) -> Result<(), Error> {
+  let repo = Repository::open(path)?;
+  let mut cfg = repo.config()?;
+  cfg.set_str("so.mdata.harness", harness.as_str())?;
+  cfg.set_str("so.mdata.sandbox", sandbox.as_str())?;
+  cfg.set_str("so.mdata.task-id", task_id)?;
+  Ok(())
+}
+
+fn read_mdata(path: &Path) -> Result<Mdata, Error> {
+  let repo = Repository::open(path)?;
+  let cfg = repo.config()?;
+  let harness = cfg.get_string("so.mdata.harness").ok().and_then(|v| parse_harness(&v));
+  let sandbox = cfg.get_string("so.mdata.sandbox").ok().and_then(|v| parse_sandbox_type(&v));
+  let task_id = cfg.get_string("so.mdata.task-id").ok();
+  match (harness, sandbox, task_id) {
+    (Some(h), Some(s), Some(t)) => Ok(Mdata { harness: h, sandbox: s, task_id: t }),
+    _ => Err(Error::Other("sandbox metadata missing, start a new run".into())),
+  }
+}
+
+fn parse_harness(s: &str) -> Option<Harness> {
+  match s.to_lowercase().as_str() {
+    "claude" => Some(Harness::Claude),
+    "opencode" => Some(Harness::Opencode),
+    "codex" => Some(Harness::Codex),
+    _ => None,
+  }
+}
+
+fn parse_sandbox_type(s: &str) -> Option<SandboxType> {
+  match s.to_lowercase().as_str() {
+    "docker" => Some(SandboxType::Docker),
+    "bwrap" => Some(SandboxType::Bwrap),
+    _ => None,
+  }
+}
+
 // =============================================================================
 // Sandbox menu
 // =============================================================================
@@ -797,11 +896,12 @@ fn run_git(args: &[&str], cwd: &Path) -> bool {
 async fn run_menu(sandbox: &Path, base: &str, orig: &Path, branch: &str) -> Result<(), Error> {
   loop {
     println!(
-      " {}iff  {}hell  {}eset  {}erge  {}uit",
+      " {}iff  {}hell  {}eset  {}erge  {}ontinue  {}uit",
       "[d]".cyan().bold(),
       "[s]".cyan().bold(),
       "[r]".cyan().bold(),
       "[m]".cyan().bold(),
+      "[c]".cyan().bold(),
       "[q]".cyan().bold()
     );
     print!("> ");
@@ -926,6 +1026,78 @@ async fn run_menu(sandbox: &Path, base: &str, orig: &Path, branch: &str) -> Resu
           println!(" {}", format!("Conflict. Sandbox kept at: {}", sandbox.display()).red());
         }
         break;
+      }
+      'c' => {
+        if let Some(status) = read_status(sandbox)
+          && is_done(&status)
+        {
+          if let Some(pending) = task_count(sandbox) {
+            if pending > 0 {
+              set_status_pending(sandbox)?;
+            } else {
+              eprintln!("{} all tasks complete", "error:".red().bold());
+              println!();
+              continue;
+            }
+          } else {
+            eprintln!("{} all tasks complete", "error:".red().bold());
+            println!();
+            continue;
+          }
+        }
+        let mdata = match read_mdata(sandbox) {
+          Ok(m) => m,
+          Err(e) => {
+            eprintln!("{} {}", "error:".red().bold(), e);
+            println!();
+            continue;
+          }
+        };
+        print!("Iterations? [q]uit (default 10): ");
+        io::stdout().flush()?;
+        let input = read_line_trim()?;
+        let lower = input.to_lowercase();
+        if lower == "q" {
+          println!();
+          continue;
+        }
+        let n = if input.is_empty() {
+          10
+        } else {
+          match input.parse::<u32>() {
+            Ok(v) if v > 0 => v,
+            _ => {
+              println!(" {}", "invalid iterations".red());
+              println!();
+              continue;
+            }
+          }
+        };
+
+        validate_sandbox(mdata.sandbox)?;
+        let sb = sandbox::Sandbox {
+          path: sandbox.to_path_buf(),
+          original: orig.to_path_buf(),
+          branch: branch.into(),
+          task_id: mdata.task_id.clone(),
+        };
+        let start = Instant::now();
+        print_sandbox_start(mdata.harness, n, mdata.sandbox, &mdata.task_id);
+        match run_sandbox_iterations(&sb, mdata.harness, n, mdata.sandbox).await {
+          Ok(RunOutcome::Completed) => {
+            println!();
+            print_summary(
+              &sandbox::git_stat(&sb.path, base),
+              Some(&fmt_time(start.elapsed())),
+              Some(&sb.path.display().to_string()),
+            );
+            println!();
+          }
+          Ok(RunOutcome::Interrupted) => {
+            println!("\n{}", format!("Interrupted. Sandbox kept at: {}", sb.path.display()).yellow());
+          }
+          Err(e) => return Err(e),
+        }
       }
       'q' => {
         println!("{}", format!("Sandbox kept at: {}", sandbox.display()).yellow());

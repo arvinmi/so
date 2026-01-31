@@ -26,6 +26,21 @@ cargo install so
 sudo apt install bubblewrap
 ```
 
+> Note: Ubuntu 24.04+ blocks unprivileged user namespaces for bwrap with AppArmor. The recommended fix is below.
+
+```bash
+sudo tee /etc/apparmor.d/bwrap <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(default_allow) {
+  userns,
+  include if exists <local/bwrap>
+}
+EOF
+sudo systemctl restart apparmor
+```
+
 **Docker**:
 
 macOS:

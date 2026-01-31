@@ -11,13 +11,13 @@ Run type checks, linter, and tests.
 
 # COMMIT
 Update specs/implementation-plan.md to mark task done.
-Commit with message:
+Commit now. Message format:
 - What: <what was done>
 - Why: <reasoning>
 - Alternatives: <what else was considered>
 
 # STATUS
-Set specs/status.md to "done" when ALL complete, "blocked" if stuck.
+Set specs/status.md to "done" when all tasks are complete, "blocked" if stuck.
 
 # FINAL
 ONE TASK ONLY. Commit when done.
