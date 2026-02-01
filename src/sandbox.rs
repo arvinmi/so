@@ -130,14 +130,14 @@ pub fn list() -> Result<Vec<Info>, Error> {
 // Run
 // =============================================================================
 
-pub async fn run(sb: &Sandbox, harness: &str, iterations: u32, st: SandboxType) -> Result<(), Error> {
+pub async fn run(sb: &Sandbox, harness: &str, iterations: u32, st: SandboxType, use_tui: bool) -> Result<(), Error> {
   match st {
-    SandboxType::Bwrap => run_bwrap(sb, harness, iterations).await,
-    SandboxType::Docker => run_docker(sb, harness, iterations).await,
+    SandboxType::Bwrap => run_bwrap(sb, harness, iterations, use_tui).await,
+    SandboxType::Docker => run_docker(sb, harness, iterations, use_tui).await,
   }
 }
 
-async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), Error> {
+async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32, use_tui: bool) -> Result<(), Error> {
   let project = project_name(&sb.original).to_string_lossy();
   let dockerfile = sb.original.join("Dockerfile.sandbox");
   if !dockerfile.exists() {
@@ -209,9 +209,13 @@ async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), 
   if let Ok(e) = std::env::var("EFFORT") {
     cmd.args(["-e", &format!("EFFORT={}", e)]);
   }
+  if use_tui {
+    cmd.args(["-e", "SO_TUI=1"]);
+  }
 
   cmd.args(["-w", &code]).arg(&image);
-  cmd.args(["/opt/so/so", "-H", harness, "step", "-i", &iterations.to_string()]);
+  cmd.args(["/opt/so/so", "-H", harness, "step"]);
+  cmd.args(["-i", &iterations.to_string()]);
   cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
 
   let child = match cmd.spawn() {
@@ -233,7 +237,7 @@ async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), 
   Ok(())
 }
 
-async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), Error> {
+async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32, use_tui: bool) -> Result<(), Error> {
   let home = dirs::home_dir().ok_or(Error::NoHome)?;
   let code = home.join(project_name(&sb.original));
   let creds = setup_creds()?;
@@ -376,6 +380,11 @@ async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), E
     push_arg(&mut a, "--setenv");
     push_arg(&mut a, "EFFORT");
     push_arg(&mut a, &e);
+  }
+  if use_tui {
+    push_arg(&mut a, "--setenv");
+    push_arg(&mut a, "SO_TUI");
+    push_arg(&mut a, "1");
   }
 
   push_arg(&mut a, "--chdir");

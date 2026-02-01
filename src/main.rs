@@ -1,4 +1,5 @@
 mod sandbox;
+mod tui;
 
 use std::{
   cmp::min,
@@ -20,7 +21,7 @@ use thiserror::Error;
 use tokio::process::Command;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
-enum Harness {
+pub enum Harness {
   #[default]
   Claude,
   Opencode,
@@ -28,7 +29,7 @@ enum Harness {
 }
 
 impl Harness {
-  fn as_str(self) -> &'static str {
+  pub fn as_str(self) -> &'static str {
     match self {
       Harness::Claude => "claude",
       Harness::Opencode => "opencode",
@@ -134,7 +135,7 @@ enum TaskMode {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum RunMode {
+pub enum RunMode {
   Step,
   Run,
 }
@@ -167,7 +168,10 @@ async fn run() -> Result<(), Error> {
   }
 
   match cli.command.unwrap_or(Cmd::Menu) {
-    Cmd::Run => do_run(h, cli.iterations, st).await,
+    Cmd::Run => {
+      let use_tui = std::io::IsTerminal::is_terminal(&std::io::stdin());
+      do_run(h, cli.iterations, st, use_tui).await
+    }
     Cmd::Step => do_step(h, cli.iterations).await,
     Cmd::Plan => do_plan(h).await,
     Cmd::Clean => do_clean(h, cli.iterations, st).await,
@@ -228,7 +232,7 @@ async fn do_step(harness: Harness, iterations: u32) -> Result<(), Error> {
   let cwd = std::env::current_dir()?;
   let unattended = std::env::var("SO_UNATTENDED").is_ok();
   let mode = if unattended { RunMode::Run } else { RunMode::Step };
-
+  let use_tui = unattended && std::env::var("SO_TUI").is_ok() && std::io::IsTerminal::is_terminal(&std::io::stdin());
   let start_head = sandbox::git_head(&cwd).ok();
   let start = Instant::now();
 
@@ -239,7 +243,13 @@ async fn do_step(harness: Harness, iterations: u32) -> Result<(), Error> {
     std::fs::write(cwd.join("specs/status.md"), "Status: pending\n")?;
   }
 
-  run_loop(mode, harness, iterations, &cwd).await?;
+  let effective_max = effective_max(&cwd, iterations);
+  if use_tui {
+    let name = cwd.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "sandbox".into());
+    tui::run(name, harness, mode, effective_max, cwd.clone()).await?;
+  } else {
+    run_loop(mode, harness, effective_max, &cwd).await?;
+  }
 
   if !unattended && let Some(base) = start_head {
     println!();
@@ -248,7 +258,7 @@ async fn do_step(harness: Harness, iterations: u32) -> Result<(), Error> {
   Ok(())
 }
 
-async fn do_run(harness: Harness, iterations: u32, st: SandboxType) -> Result<(), Error> {
+async fn do_run(harness: Harness, iterations: u32, st: SandboxType, use_tui: bool) -> Result<(), Error> {
   validate_sandbox(st)?;
   let cwd = std::env::current_dir()?;
 
@@ -266,8 +276,11 @@ async fn do_run(harness: Harness, iterations: u32, st: SandboxType) -> Result<()
 
   let start = Instant::now();
   let effective_max = effective_max(&sb.path, iterations);
-  print_sandbox_start(harness, effective_max, st, &sb.task_id);
-  finalize_sandbox(&sb, harness, effective_max, &cwd, start, st).await
+
+  if !use_tui {
+    print_sandbox_start(harness, effective_max, st, &sb.task_id);
+  }
+  finalize_sandbox(&sb, harness, effective_max, &cwd, start, st, use_tui).await
 }
 
 async fn do_clean(harness: Harness, iterations: u32, st: SandboxType) -> Result<(), Error> {
@@ -320,7 +333,7 @@ async fn run_with_prompt(
 
   let start = Instant::now();
   print_sandbox_start(harness, iterations, st, &sb.task_id);
-  finalize_sandbox(&sb, harness, iterations, &cwd, start, st).await
+  finalize_sandbox(&sb, harness, iterations, &cwd, start, st, false).await
 }
 
 async fn do_plan(harness: Harness) -> Result<(), Error> {
@@ -554,12 +567,7 @@ async fn run_loop(mode: RunMode, harness: Harness, max: u32, cwd: &Path) -> Resu
     let iter_start = Instant::now();
 
     let base = std::fs::read_to_string(&prompt_path)?;
-    let prompt = if mode == RunMode::Step {
-      format!("{}\n\nDo not commit, human will handle that.\n\n---\nIteration {}/{}.", base, i, effective_max)
-    } else {
-      let commits = sandbox::git_recent(cwd, sandbox::BASE_TAG, 10);
-      format!("{}\n\nRecent commits:\n{}\n\n---\nIteration {}/{}.", base, commits, i, effective_max)
-    };
+    let prompt = build_prompt(&base, mode, cwd, i, effective_max);
 
     run_harness(harness, &prompt, mode, TaskMode::Code, cwd).await?;
 
@@ -592,6 +600,18 @@ fn task_count(cwd: &Path) -> Option<u32> {
   let content = std::fs::read_to_string(plan).ok()?;
   let count = content.lines().filter(|l| l.trim_start().starts_with("- [ ]")).count();
   if count == 0 { None } else { Some(count as u32) }
+}
+
+pub(crate) fn build_prompt(base: &str, mode: RunMode, cwd: &Path, iter: u32, max_iter: u32) -> String {
+  match mode {
+    RunMode::Step => {
+      format!("{}\n\nDo not commit, human will handle that.\n\n---\nIteration {}/{}.", base, iter, max_iter)
+    }
+    RunMode::Run => {
+      let commits = sandbox::git_recent(cwd, sandbox::BASE_TAG, 10);
+      format!("{}\n\nRecent commits:\n{}\n\n---\nIteration {}/{}.", base, commits, iter, max_iter)
+    }
+  }
 }
 
 // =============================================================================
@@ -776,8 +796,9 @@ async fn finalize_sandbox(
   cwd: &Path,
   start: Instant,
   st: SandboxType,
+  use_tui: bool,
 ) -> Result<(), Error> {
-  match run_sandbox_iterations(sb, harness, iterations, st).await {
+  match run_sandbox_iterations(sb, harness, iterations, st, use_tui).await {
     Ok(RunOutcome::Completed) => {
       println!();
       print_summary(
@@ -837,8 +858,9 @@ async fn run_sandbox_iterations(
   harness: Harness,
   iterations: u32,
   st: SandboxType,
+  use_tui: bool,
 ) -> Result<RunOutcome, Error> {
-  match sandbox::run(sb, harness.as_str(), iterations, st).await {
+  match sandbox::run(sb, harness.as_str(), iterations, st, use_tui).await {
     Ok(()) => Ok(RunOutcome::Completed),
     Err(Error::Interrupted) => Ok(RunOutcome::Interrupted),
     Err(e) => Err(e),
@@ -1083,7 +1105,7 @@ async fn run_menu(sandbox: &Path, base: &str, orig: &Path, branch: &str) -> Resu
         };
         let start = Instant::now();
         print_sandbox_start(mdata.harness, n, mdata.sandbox, &mdata.task_id);
-        match run_sandbox_iterations(&sb, mdata.harness, n, mdata.sandbox).await {
+        match run_sandbox_iterations(&sb, mdata.harness, n, mdata.sandbox, false).await {
           Ok(RunOutcome::Completed) => {
             println!();
             print_summary(
