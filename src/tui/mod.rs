@@ -1,18 +1,18 @@
+pub mod actions;
+pub mod menu;
+pub mod popup;
 mod ui;
 
 use std::{
   collections::VecDeque,
-  io::{self, Write},
+  io,
   path::{Path, PathBuf},
   process::Stdio,
   time::{Duration, Instant},
 };
 
 use crossterm::{
-  event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    MouseEvent, MouseEventKind,
-  },
+  event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind},
   execute,
   terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -27,6 +27,8 @@ use tokio::{
 
 use crate::{Error, Harness, RunMode, build_prompt};
 
+const ACTIVITY_CAPACITY: usize = 1000;
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -36,6 +38,23 @@ pub enum RunStatus {
   #[default]
   Running,
   Done,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RunPopup {
+  #[default]
+  None,
+  Options,
+  Reset {
+    commits: Vec<(String, String)>,
+    selected: usize,
+  },
+  Continue {
+    input: String,
+  },
+  Error {
+    message: String,
+  },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -119,10 +138,12 @@ enum TermEvent {
 
 pub struct AppState {
   pub sandbox_name: String,
+  pub sandbox_path: PathBuf,
   pub harness: String,
   pub start_time: Instant,
   pub end_time: Option<Instant>,
   pub status: RunStatus,
+  pub popup: RunPopup,
   pub current_iter: u32,
   pub max_iter: u32,
   pub iterations: Vec<Iteration>,
@@ -137,19 +158,22 @@ pub struct AppState {
   pub activity_visible: usize,
   pub iter_visible: usize,
   pub should_quit: bool,
+  pub interrupted: bool,
   pub plan_tasks: Vec<String>,
   plan_raw: String,
 }
 
 impl AppState {
-  pub fn new(sandbox_name: String, harness: String, max_iter: u32) -> Self {
+  pub fn new(sandbox_name: String, sandbox_path: PathBuf, harness: String, max_iter: u32) -> Self {
     let iterations = (1..=max_iter).map(Iteration::new).collect();
     Self {
       sandbox_name,
+      sandbox_path,
       harness,
       start_time: Instant::now(),
       end_time: None,
       status: RunStatus::Running,
+      popup: RunPopup::None,
       current_iter: 0,
       max_iter,
       iterations,
@@ -157,13 +181,14 @@ impl AppState {
       insertions: 0,
       deletions: 0,
       commit_count: 0,
-      activity: VecDeque::with_capacity(1000),
+      activity: VecDeque::with_capacity(ACTIVITY_CAPACITY),
       focus: FocusPane::Activity,
       scroll_offset: 0,
       iter_scroll_offset: 0,
       activity_visible: 10,
       iter_visible: 5,
       should_quit: false,
+      interrupted: false,
       plan_tasks: Vec::new(),
       plan_raw: String::new(),
     }
@@ -194,7 +219,7 @@ impl AppState {
   }
 
   pub fn add_activity(&mut self, kind: ActivityKind, content: String) {
-    if self.activity.len() >= 1000 {
+    if self.activity.len() >= ACTIVITY_CAPACITY {
       self.activity.pop_front();
     }
     self.activity.push_back(ActivityEntry { timestamp: Instant::now(), kind, content });
@@ -275,17 +300,16 @@ pub async fn run(
   max_iter: u32,
   cwd: PathBuf,
 ) -> Result<(), Error> {
-  enable_raw_mode().map_err(|e| Error::Other(format!("failed to enable raw mode: {}", e)))?;
+  enable_raw_mode().map_err(|e| Error::RawModeEnable(e.to_string()))?;
   let mut stdout = io::stdout();
-  execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-    .map_err(|e| Error::Other(format!("failed to enter alternate screen: {}", e)))?;
+  execute!(stdout, EnterAlternateScreen).map_err(|e| Error::AlternateScreenEnter(e.to_string()))?;
   let backend = CrosstermBackend::new(stdout);
-  let mut terminal = Terminal::new(backend).map_err(|e| Error::Other(format!("failed to create terminal: {}", e)))?;
+  let mut terminal = Terminal::new(backend).map_err(|e| Error::TerminalCreate(e.to_string()))?;
 
   let result = run_loop(&mut terminal, sandbox_name, harness, mode, max_iter, cwd).await;
 
   disable_raw_mode().ok();
-  execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).ok();
+  execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
   terminal.show_cursor().ok();
 
   result
@@ -299,13 +323,14 @@ async fn run_loop(
   max_iter: u32,
   cwd: PathBuf,
 ) -> Result<(), Error> {
-  let mut state = AppState::new(sandbox_name, harness.as_str().into(), max_iter);
+  let mut state = AppState::new(sandbox_name, cwd.clone(), harness.as_str().into(), max_iter);
   state.refresh_plan(&cwd);
+  load_activity_log(&mut state, &cwd);
 
   let (harness_tx, mut harness_rx) = mpsc::unbounded_channel::<HarnessEvent>();
   let harness_handle = tokio::spawn(run_harness_loop(harness, mode, max_iter, cwd.clone(), harness_tx));
 
-  // use EventStream for reliable async event reading (works in tmux)
+  // use EventStream for reliable async event reading
   let mut event_stream = EventStream::new();
   let mut last_refresh = Instant::now();
   let tick_rate = Duration::from_millis(50);
@@ -313,18 +338,14 @@ async fn run_loop(
   loop {
     terminal.draw(|f| ui::render(f, &mut state))?;
 
-    // use tokio::select! to wait on multiple async sources
     tokio::select! {
       // terminal events via EventStream
       maybe_event = event_stream.next() => {
         match maybe_event {
           Some(Ok(Event::Key(key))) => {
             // only handle key press events
-            if key.kind == KeyEventKind::Press
-              && handle_term_event(&mut state, TermEvent::Key(key), terminal, &cwd)?
-            {
-              harness_handle.abort();
-              return Ok(());
+            if key.kind == KeyEventKind::Press {
+              handle_term_event(&mut state, TermEvent::Key(key), terminal, &cwd)?;
             }
           }
           Some(Ok(Event::Resize(_, _))) => {
@@ -356,6 +377,11 @@ async fn run_loop(
   }
 
   harness_handle.abort();
+
+  if state.interrupted {
+    return Err(crate::Error::Interrupted);
+  }
+
   Ok(())
 }
 
@@ -370,9 +396,37 @@ fn handle_harness_event(state: &mut AppState, event: HarnessEvent) {
     HarnessEvent::Finished => {
       state.status = RunStatus::Done;
       state.end_time = Some(Instant::now());
-      state.add_activity(ActivityKind::Text, "-- run complete, press ^C to exit --".into());
+      state.popup = RunPopup::Options;
     }
   }
+}
+
+fn load_activity_log(state: &mut AppState, cwd: &Path) {
+  let repo = match git2::Repository::open(cwd) {
+    Ok(r) => r,
+    Err(_) => return,
+  };
+  let mut cfg = match repo.config() {
+    Ok(c) => c,
+    Err(_) => return,
+  };
+  {
+    let mut entries = match cfg.entries(Some("so.activity")) {
+      Ok(e) => e,
+      Err(_) => return,
+    };
+    while let Some(entry) = entries.next() {
+      if let Ok(e) = entry
+        && let Some(v) = e.value()
+      {
+        let v = v.trim();
+        if !v.is_empty() {
+          state.add_activity(ActivityKind::Text, v.to_string());
+        }
+      }
+    }
+  }
+  let _ = cfg.remove_multivar("so.activity", ".*");
 }
 
 fn handle_term_event(
@@ -380,42 +434,48 @@ fn handle_term_event(
   event: TermEvent,
   terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
   cwd: &Path,
-) -> Result<bool, Error> {
+) -> Result<(), Error> {
   match event {
     TermEvent::Key(key) => {
-      if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        state.should_quit = true;
-        return Ok(true);
+      if handle_ctrl_c(state, key) {
+        return Ok(());
       }
-      if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        suspend_and_run(terminal, "git diff", cwd)?;
-      }
-      if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        let shell = std::env::var("SHELL").expect("SHELL env not set");
-        suspend_and_run(terminal, &shell, cwd)?;
-      }
-      if key.code == KeyCode::Tab {
-        state.toggle_focus();
-      }
-      match key.code {
-        KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => state.scroll_up(),
-        KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => state.scroll_down(),
-        KeyCode::Home => {
-          // scroll to top
-          match state.focus {
-            FocusPane::Activity => state.scroll_offset = state.activity.len().saturating_sub(1),
-            FocusPane::Iterations => state.iter_scroll_offset = 0,
+
+      let mut popup = std::mem::replace(&mut state.popup, RunPopup::None);
+      let handled_popup = match &mut popup {
+        RunPopup::Options => {
+          if let Some(next) = handle_popup_options(state, key, terminal, cwd)? {
+            popup = next;
           }
+          true
         }
-        KeyCode::End => {
-          // scroll to bottom
-          match state.focus {
-            FocusPane::Activity => state.scroll_offset = 0,
-            FocusPane::Iterations => state.iter_scroll_offset = state.iterations.len().saturating_sub(1),
+        RunPopup::Reset { commits, selected } => {
+          if let Some(next) = handle_popup_reset(state, key, cwd, commits.as_slice(), selected)? {
+            popup = next;
           }
+          true
         }
-        _ => {}
+        RunPopup::Continue { input } => {
+          if let Some(next) = handle_popup_continue(state, key, input)? {
+            popup = next;
+          }
+          true
+        }
+        RunPopup::Error { .. } => {
+          if let Some(next) = handle_popup_error(key) {
+            popup = next;
+          }
+          true
+        }
+        RunPopup::None => false,
+      };
+
+      state.popup = popup;
+      if handled_popup {
+        return Ok(());
       }
+
+      handle_nav_keys(state, key);
     }
     TermEvent::Mouse(mouse) => match mouse.kind {
       MouseEventKind::ScrollUp => state.scroll_up(),
@@ -424,24 +484,158 @@ fn handle_term_event(
     },
     TermEvent::Resize => {}
   }
-  Ok(false)
+  Ok(())
 }
 
-fn suspend_and_run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, cmd: &str, cwd: &Path) -> Result<(), Error> {
-  disable_raw_mode().ok();
-  execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).ok();
-  terminal.show_cursor().ok();
+fn handle_ctrl_c(state: &mut AppState, key: KeyEvent) -> bool {
+  if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+    state.should_quit = true;
+    state.interrupted = true;
+    return true;
+  }
+  false
+}
 
-  let _ = std::process::Command::new("sh").arg("-c").arg(cmd).current_dir(cwd).status();
+fn handle_popup_options(
+  state: &mut AppState,
+  key: KeyEvent,
+  terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+  cwd: &Path,
+) -> Result<Option<RunPopup>, Error> {
+  let mut replace = None;
+  match key.code {
+    KeyCode::Char('d') => {
+      let range = actions::diff_range(cwd);
+      actions::suspend_and_run_git(terminal, &["diff", &range], cwd, false)?;
+    }
+    KeyCode::Char('s') => {
+      actions::suspend_and_run_shell(terminal, cwd, false)?;
+    }
+    KeyCode::Char('r') => {
+      let commits = crate::sandbox::git_commits(cwd, crate::sandbox::BASE_TAG).unwrap_or_default();
+      if commits.is_empty() {
+        replace = Some(RunPopup::Error { message: "No commits to reset".into() });
+      } else {
+        replace = Some(RunPopup::Reset { commits, selected: 0 });
+      }
+    }
+    KeyCode::Char('m') => {
+      if let Some(orig) = actions::original_repo(cwd) {
+        match actions::merge_sandbox(cwd, &orig) {
+          Ok(()) => {
+            replace = Some(RunPopup::None);
+            state.should_quit = true;
+          }
+          Err(err) => {
+            replace = Some(RunPopup::Error { message: err.to_string() });
+          }
+        }
+      } else {
+        replace = Some(RunPopup::Error { message: Error::OriginalRepoNotFound.to_string() });
+      }
+    }
+    KeyCode::Char('c') => {
+      replace = Some(RunPopup::Continue { input: String::new() });
+    }
+    KeyCode::Char('q') | KeyCode::Esc => {
+      replace = Some(RunPopup::None);
+    }
+    _ => {}
+  }
+  Ok(replace)
+}
 
-  print!("\nPress Enter to continue...");
-  io::stdout().flush().ok();
-  let _ = io::stdin().read_line(&mut String::new());
+fn handle_popup_reset(
+  state: &mut AppState,
+  key: KeyEvent,
+  cwd: &Path,
+  commits: &[(String, String)],
+  selected: &mut usize,
+) -> Result<Option<RunPopup>, Error> {
+  let mut replace = None;
+  match key.code {
+    KeyCode::Up | KeyCode::Char('k') => {
+      if *selected > 0 {
+        *selected -= 1;
+      }
+    }
+    KeyCode::Down | KeyCode::Char('j') => {
+      if *selected + 1 < commits.len() {
+        *selected += 1;
+      }
+    }
+    KeyCode::Enter => {
+      if let Some((hash, _)) = commits.get(*selected) {
+        let ok = actions::git_reset_hard(cwd, hash);
+        if !ok {
+          replace = Some(RunPopup::Error { message: "Reset failed".into() });
+          return Ok(replace);
+        }
+        update_git_stats_state(state, cwd);
+      }
+      replace = Some(RunPopup::Options);
+    }
+    KeyCode::Esc => {
+      replace = Some(RunPopup::Options);
+    }
+    _ => {}
+  }
+  Ok(replace)
+}
 
-  execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture).ok();
-  enable_raw_mode().ok();
-  terminal.clear().ok();
-  Ok(())
+fn handle_popup_continue(state: &mut AppState, key: KeyEvent, input: &mut String) -> Result<Option<RunPopup>, Error> {
+  let mut replace = None;
+  match key.code {
+    KeyCode::Char(c) if c.is_ascii_digit() => {
+      if input.len() < 3 {
+        input.push(c);
+      }
+    }
+    KeyCode::Backspace => {
+      input.pop();
+    }
+    KeyCode::Enter => {
+      let extra: u32 = input.parse().unwrap_or(10);
+      state.max_iter += extra;
+      for n in (state.current_iter + 1)..=(state.max_iter) {
+        state.iterations.push(Iteration::new(n));
+      }
+      state.status = RunStatus::Running;
+      replace = Some(RunPopup::None);
+    }
+    KeyCode::Esc => {
+      replace = Some(RunPopup::Options);
+    }
+    _ => {}
+  }
+  Ok(replace)
+}
+
+fn handle_popup_error(key: KeyEvent) -> Option<RunPopup> {
+  match key.code {
+    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => Some(RunPopup::Options),
+    _ => None,
+  }
+}
+
+fn handle_nav_keys(state: &mut AppState, key: KeyEvent) {
+  if key.code == KeyCode::Tab {
+    state.toggle_focus();
+  }
+
+  match key.code {
+    KeyCode::Char('k') | KeyCode::Up | KeyCode::PageUp => state.scroll_up(),
+    KeyCode::Char('j') | KeyCode::Down | KeyCode::PageDown => state.scroll_down(),
+    KeyCode::Home => match state.focus {
+      FocusPane::Activity => state.scroll_offset = state.activity.len().saturating_sub(1),
+      FocusPane::Iterations => state.iter_scroll_offset = 0,
+    },
+    KeyCode::End => match state.focus {
+      FocusPane::Activity => state.scroll_offset = 0,
+      FocusPane::Iterations => state.iter_scroll_offset = state.iterations.len().saturating_sub(1),
+    },
+    _ => {}
+  }
 }
 
 // =============================================================================
@@ -455,6 +649,15 @@ async fn run_harness_loop(
   cwd: PathBuf,
   tx: mpsc::UnboundedSender<HarnessEvent>,
 ) {
+  let _ =
+    tx.send(HarnessEvent::Activity { kind: ActivityKind::Text, content: format!("starting {}", harness.as_str()) });
+
+  if harness == Harness::Claude
+    && let Ok(task_id) = get_task_id(&cwd)
+  {
+    let _ = tx.send(HarnessEvent::Activity { kind: ActivityKind::Text, content: format!("tasks: {}", task_id) });
+  }
+
   for i in 1..=max_iter {
     let _ = tx.send(HarnessEvent::IterationStart { n: i });
 
@@ -530,8 +733,8 @@ async fn run_opencode(
   tx: &mpsc::UnboundedSender<HarnessEvent>,
   current_iter: u32,
 ) -> Result<(), Error> {
-  let model = std::env::var("MODEL").unwrap_or_else(|_| "openai/gpt-5.2-codex".into());
-  let effort = std::env::var("EFFORT").unwrap_or_else(|_| "medium".into());
+  let model = env_or_default("MODEL", "openai/gpt-5.2-codex");
+  let effort = env_or_default("EFFORT", "medium");
 
   let mut cmd = Command::new("opencode");
   cmd.env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#);
@@ -556,8 +759,8 @@ async fn run_codex(
   tx: &mpsc::UnboundedSender<HarnessEvent>,
   current_iter: u32,
 ) -> Result<(), Error> {
-  let model = std::env::var("MODEL").unwrap_or_else(|_| "gpt-5.2-codex".into());
-  let effort = std::env::var("EFFORT").unwrap_or_else(|_| "medium".into());
+  let model = env_or_default("MODEL", "gpt-5.2-codex");
+  let effort = env_or_default("EFFORT", "medium");
 
   let mut cmd = Command::new("codex");
   let cfg = format!("model_reasoning_effort={}", effort);
@@ -607,20 +810,28 @@ where
 }
 
 fn update_git_stats(cwd: &Path, tx: &mpsc::UnboundedSender<HarnessEvent>) {
-  if let Ok(repo) = git2::Repository::open(cwd)
-    && let Ok(tree) =
-      repo.revparse_single(&crate::sandbox::git_base(cwd, crate::sandbox::BASE_TAG)).and_then(|o| o.peel_to_tree())
-    && let Ok(diff) = repo.diff_tree_to_workdir_with_index(Some(&tree), None)
-    && let Ok(stats) = diff.stats()
-  {
-    let commits = count_commits(&repo, cwd).unwrap_or(0);
-    let _ = tx.send(HarnessEvent::GitStats {
-      files: stats.files_changed() as u32,
-      ins: stats.insertions() as u32,
-      del: stats.deletions() as u32,
-      commits,
-    });
+  if let Some((files, ins, del, commits)) = collect_git_stats(cwd) {
+    let _ = tx.send(HarnessEvent::GitStats { files, ins, del, commits });
   }
+}
+
+fn update_git_stats_state(state: &mut AppState, cwd: &Path) {
+  if let Some((files, ins, del, commits)) = collect_git_stats(cwd) {
+    state.files_changed = files;
+    state.insertions = ins;
+    state.deletions = del;
+    state.commit_count = commits;
+  }
+}
+
+fn collect_git_stats(cwd: &Path) -> Option<(u32, u32, u32, u32)> {
+  let repo = git2::Repository::open(cwd).ok()?;
+  let base = crate::sandbox::git_base(cwd, crate::sandbox::BASE_TAG);
+  let tree = repo.revparse_single(&base).ok()?.peel_to_tree().ok()?;
+  let diff = repo.diff_tree_to_workdir_with_index(Some(&tree), None).ok()?;
+  let stats = diff.stats().ok()?;
+  let commits = count_commits(&repo, cwd).unwrap_or(0);
+  Some((stats.files_changed() as u32, stats.insertions() as u32, stats.deletions() as u32, commits))
 }
 
 fn count_commits(repo: &git2::Repository, cwd: &Path) -> Option<u32> {
@@ -676,6 +887,10 @@ fn truncate_chars(s: &str, max: usize) -> String {
   }
   let count = s.chars().count();
   if count <= max { s.to_string() } else { s.chars().take(max).collect() }
+}
+
+fn env_or_default(name: &str, default: &str) -> String {
+  std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
 // claude stream-json parser
@@ -872,4 +1087,14 @@ fn parse_codex(line: &str, tx: &mpsc::UnboundedSender<HarnessEvent>) {
   if !content.is_empty() {
     let _ = tx.send(HarnessEvent::Activity { kind, content });
   }
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+fn get_task_id(cwd: &Path) -> Result<String, Error> {
+  let repo = git2::Repository::open(cwd)?;
+  let cfg = repo.config()?;
+  cfg.get_string("so.mdata.task-id").map_err(Error::Git)
 }

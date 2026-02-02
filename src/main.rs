@@ -3,7 +3,6 @@ mod tui;
 
 use std::{
   cmp::min,
-  collections::HashMap,
   io::{self, Write},
   path::Path,
   process::Stdio,
@@ -60,6 +59,36 @@ pub enum Error {
   NoDockerfile,
   #[error("cannot determine home directory")]
   NoHome,
+  #[error("run requires a terminal")]
+  RunRequiresTerminal,
+  #[error("sandbox run requires a terminal")]
+  SandboxRequiresTerminal,
+  #[error("bubblewrap not available on macOS, use --sandbox docker")]
+  BwrapUnavailableMacos,
+  #[error("bubblewrap not installed, run `sudo apt install bubblewrap`")]
+  BwrapNotInstalled,
+  #[error("bwrap blocked by apparmor restriction")]
+  BwrapBlocked,
+  #[error("docker not installed")]
+  DockerNotInstalled,
+  #[error("docker not running")]
+  DockerNotRunning,
+  #[error("cannot determine original repo")]
+  OriginalRepoNotFound,
+  #[error("sandbox metadata missing, start a new run")]
+  SandboxMetadataMissing,
+  #[error("menu requires a terminal")]
+  MenuRequiresTerminal,
+  #[error("failed to enable raw mode: {0}")]
+  RawModeEnable(String),
+  #[error("failed to enter alternate screen: {0}")]
+  AlternateScreenEnter(String),
+  #[error("failed to create terminal: {0}")]
+  TerminalCreate(String),
+  #[error("bwrap spawn failed: {0}")]
+  BwrapSpawn(String),
+  #[error("bwrap exited with code {0}")]
+  BwrapExit(i32),
   #[error("interrupted")]
   Interrupted,
   #[error("{0}")]
@@ -153,6 +182,16 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Error> {
+  let result = run_inner().await;
+
+  if matches!(result, Err(Error::Interrupted)) {
+    std::process::exit(130);
+  }
+
+  result
+}
+
+async fn run_inner() -> Result<(), Error> {
   let cli = Cli::parse();
   let h = cli.harness;
   let model = cli.model;
@@ -169,8 +208,10 @@ async fn run() -> Result<(), Error> {
 
   match cli.command.unwrap_or(Cmd::Menu) {
     Cmd::Run => {
-      let use_tui = std::io::IsTerminal::is_terminal(&std::io::stdin());
-      do_run(h, cli.iterations, st, use_tui).await
+      if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(Error::RunRequiresTerminal);
+      }
+      do_run(h, cli.iterations, st).await
     }
     Cmd::Step => do_step(h, cli.iterations).await,
     Cmd::Plan => do_plan(h).await,
@@ -188,20 +229,20 @@ async fn run() -> Result<(), Error> {
 fn validate_sandbox(st: SandboxType) -> Result<(), Error> {
   if st == SandboxType::Bwrap {
     if cfg!(target_os = "macos") {
-      return Err(Error::Other("bubblewrap not available on macOS, use --sandbox docker".into()));
+      return Err(Error::BwrapUnavailableMacos);
     }
     if std::process::Command::new("bwrap").arg("--version").output().is_err() {
-      return Err(Error::Other("bubblewrap not installed, run `sudo apt install bubblewrap`".into()));
+      return Err(Error::BwrapNotInstalled);
     }
     if needs_bwrap_apparmor() {
-      return Err(Error::Other("bwrap blocked by apparmor restriction".into()));
+      return Err(Error::BwrapBlocked);
     }
   } else {
     if std::process::Command::new("docker").arg("--version").output().is_err() {
-      return Err(Error::Other("docker not installed".into()));
+      return Err(Error::DockerNotInstalled);
     }
     if std::process::Command::new("docker").args(["info"]).output().map(|o| !o.status.success()).unwrap_or(true) {
-      return Err(Error::Other("docker not running".into()));
+      return Err(Error::DockerNotRunning);
     }
   }
   Ok(())
@@ -258,7 +299,7 @@ async fn do_step(harness: Harness, iterations: u32) -> Result<(), Error> {
   Ok(())
 }
 
-async fn do_run(harness: Harness, iterations: u32, st: SandboxType, use_tui: bool) -> Result<(), Error> {
+async fn do_run(harness: Harness, iterations: u32, st: SandboxType) -> Result<(), Error> {
   validate_sandbox(st)?;
   let cwd = std::env::current_dir()?;
 
@@ -269,18 +310,13 @@ async fn do_run(harness: Harness, iterations: u32, st: SandboxType, use_tui: boo
     return Err(Error::NoPrompt);
   }
 
-  print_info(&format!("Creating sandbox (run) [{}]", st.as_str()));
   let sb = sandbox::Sandbox::new(&cwd, sandbox::Mode::Run, None)?;
   set_mdata(&sb.path, harness, st, &sb.task_id)?;
-  println!("  {}", sb.path.display().to_string().dimmed());
 
   let start = Instant::now();
   let effective_max = effective_max(&sb.path, iterations);
 
-  if !use_tui {
-    print_sandbox_start(harness, effective_max, st, &sb.task_id);
-  }
-  finalize_sandbox(&sb, harness, effective_max, &cwd, start, st, use_tui).await
+  finalize_sandbox(&sb, harness, effective_max, &cwd, start, st).await
 }
 
 async fn do_clean(harness: Harness, iterations: u32, st: SandboxType) -> Result<(), Error> {
@@ -314,6 +350,9 @@ async fn run_with_prompt(
   mode: sandbox::Mode,
   st: SandboxType,
 ) -> Result<(), Error> {
+  if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    return Err(Error::SandboxRequiresTerminal);
+  }
   validate_sandbox(st)?;
   let cwd = std::env::current_dir()?;
 
@@ -321,19 +360,11 @@ async fn run_with_prompt(
     return Err(Error::UncommittedChanges);
   }
 
-  let mode_name = match mode {
-    sandbox::Mode::Run => "run",
-    sandbox::Mode::Clean => "clean",
-    sandbox::Mode::Dup => "dup",
-  };
-  print_info(&format!("Creating sandbox ({}) [{}]", mode_name, st.as_str()));
   let sb = sandbox::Sandbox::new(&cwd, mode, Some(prompt))?;
   set_mdata(&sb.path, harness, st, &sb.task_id)?;
-  println!("  {}", sb.path.display().to_string().dimmed());
 
   let start = Instant::now();
-  print_sandbox_start(harness, iterations, st, &sb.task_id);
-  finalize_sandbox(&sb, harness, iterations, &cwd, start, st, false).await
+  finalize_sandbox(&sb, harness, iterations, &cwd, start, st).await
 }
 
 async fn do_plan(harness: Harness) -> Result<(), Error> {
@@ -392,150 +423,19 @@ Start by asking what I want to learn."#;
 }
 
 async fn do_menu() -> Result<(), Error> {
+  use tui::menu::{MenuAction, run as run_menu_tui};
+
   loop {
-    let sandboxes = sandbox::list()?;
-    if sandboxes.is_empty() {
-      println!("No active sandboxes.");
-      println!("Run 'so run' to start a new sandbox.");
-      return Ok(());
-    }
-
-    // group by project
-    let mut projects: HashMap<String, Vec<&sandbox::Info>> = HashMap::new();
-    for sb in &sandboxes {
-      let project = sb
-        .name
-        .strip_prefix("sandbox-")
-        .and_then(|s| s.rsplit_once('-'))
-        .map(|(p, _)| p.to_string())
-        .unwrap_or_else(|| sb.name.clone());
-      projects.entry(project).or_default().push(sb);
-    }
-
-    let mut project_order: Vec<(String, std::time::SystemTime)> = projects
-      .iter()
-      .map(|(name, sbs)| {
-        let newest = sbs.iter().map(|sb| sb.created).max().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        (name.clone(), newest)
-      })
-      .collect();
-    project_order.sort_by(|a, b| b.1.cmp(&a.1));
-
-    println!("{}", "Sandboxes:".white().bold());
-    let mut all: Vec<&sandbox::Info> = Vec::new();
-    let mut idx = 1;
-
-    for (project, _) in &project_order {
-      if let Some(sbs) = projects.get(project) {
-        println!("\n  {}", project.magenta().bold());
-        for sb in sbs {
-          all.push(sb);
-          let age = sb.created.elapsed().map(|d| d.as_secs() / 60).unwrap_or(0);
-          let status_pad = format!("{:<8}", sb.status);
-          let status_col = match sb.status.as_str() {
-            "done" => status_pad.green(),
-            "blocked" => status_pad.red(),
-            "pending" => status_pad.yellow(),
-            _ => status_pad.dimmed(),
-          };
-          println!(
-            "    {}. {}  {} {}",
-            format!("{:>2}", idx).cyan().bold(),
-            sb.name,
-            status_col,
-            fmt_age(age).dimmed()
-          );
-          idx += 1;
-        }
+    match run_menu_tui().await? {
+      MenuAction::Quit => return Ok(()),
+      MenuAction::Merged => {
+        println!("{}", "Merged successfully. Files staged.".green());
+        return Ok(());
+      }
+      MenuAction::Run { sandbox_path, iterations } => {
+        continue_sandbox(&sandbox_path, iterations).await?;
       }
     }
-    println!();
-
-    println!(
-      " {}  {}lean  {}uit",
-      format!("[1-{}]", all.len()).cyan().bold(),
-      "[c]".cyan().bold(),
-      "[q]".cyan().bold()
-    );
-    print!("> ");
-    io::stdout().flush()?;
-    let input = read_line_trim()?;
-    if input.is_empty() {
-      continue;
-    }
-    let lower = input.to_lowercase();
-
-    if lower == "q" {
-      return Ok(());
-    }
-    if lower == "c" {
-      let mut project_names: Vec<_> = projects.keys().cloned().collect();
-      project_names.sort();
-
-      println!("Clean:");
-      for (i, name) in project_names.iter().enumerate() {
-        let count = projects.get(name).map(|v| v.len()).unwrap_or(0);
-        println!("  {}. {:<16} ({} sandboxes)", format!("{:>2}", i + 1).cyan().bold(), name, count);
-      }
-      println!();
-      println!(" {}ll    {}uit", "[a]".cyan().bold(), "[q]".cyan().bold());
-      print!("Select project to clean: ");
-      io::stdout().flush()?;
-      let choice = read_line_trim()?;
-      let choice_lower = choice.to_lowercase();
-
-      if choice_lower == "q" {
-        continue;
-      }
-      if choice_lower == "a" {
-        print!("Delete all {} sandboxes? [y/n] ", all.len());
-        io::stdout().flush()?;
-        let yn = read_line_trim()?;
-        if yn.to_lowercase().starts_with('y') {
-          for sb in &all {
-            let _ = std::fs::remove_dir_all(&sb.path);
-          }
-          println!("\nAll sandboxes cleaned.");
-          return Ok(());
-        }
-        println!();
-        continue;
-      }
-      if let Ok(n) = choice.parse::<usize>()
-        && n >= 1
-        && n <= project_names.len()
-      {
-        let project = &project_names[n - 1];
-        let group = projects.get(project).cloned().unwrap_or_default();
-        print!("Delete {} sandboxes for \"{}\"? [y/n] ", group.len(), project);
-        io::stdout().flush()?;
-        let yn = read_line_trim()?;
-        if yn.to_lowercase().starts_with('y') {
-          for sb in group {
-            let _ = std::fs::remove_dir_all(&sb.path);
-          }
-          println!("\nSandboxes cleaned for {}.", project);
-          return Ok(());
-        }
-        println!();
-        continue;
-      }
-      println!();
-      continue;
-    }
-    if let Ok(n) = input.parse::<usize>()
-      && n >= 1
-      && n <= all.len()
-    {
-      let sb = all[n - 1];
-      let branch = sandbox::git_branch(&sb.path).unwrap_or_else(|_| "sandbox/main".into());
-      let base = sandbox::git_base(&sb.path, sandbox::BASE_TAG);
-      println!();
-      print_summary(&sandbox::git_stat(&sb.path, &base), None, Some(&sb.path.display().to_string()));
-      run_menu(&sb.path, &base, &sb.original, &branch).await?;
-      return Ok(());
-    }
-    eprintln!("{} invalid choice", "error:".red().bold());
   }
 }
 
@@ -793,24 +693,25 @@ async fn finalize_sandbox(
   sb: &sandbox::Sandbox,
   harness: Harness,
   iterations: u32,
-  cwd: &Path,
-  start: Instant,
+  _cwd: &Path,
+  _start: Instant,
   st: SandboxType,
-  use_tui: bool,
 ) -> Result<(), Error> {
-  match run_sandbox_iterations(sb, harness, iterations, st, use_tui).await {
+  match run_sandbox_iterations(sb, harness, iterations, st).await {
     Ok(RunOutcome::Completed) => {
-      println!();
-      print_summary(
-        &sandbox::git_stat(&sb.path, sandbox::BASE_TAG),
-        Some(&fmt_time(start.elapsed())),
-        Some(&sb.path.display().to_string()),
-      );
-      run_menu(&sb.path, sandbox::BASE_TAG, cwd, &sb.branch).await?;
+      use tui::menu::{MenuAction, run as run_menu_tui};
+      loop {
+        match run_menu_tui().await? {
+          MenuAction::Quit | MenuAction::Merged => break,
+          MenuAction::Run { sandbox_path, iterations: iter_count } => {
+            continue_sandbox(&sandbox_path, iter_count).await?;
+          }
+        }
+      }
       Ok(())
     }
     Ok(RunOutcome::Interrupted) => {
-      println!("\n{}", format!("Interrupted. Sandbox kept at: {}", sb.path.display()).yellow());
+      println!("{}", format!("Interrupted. Sandbox kept at: {}", sb.path.display()).yellow());
       Ok(())
     }
     Err(e) => {
@@ -826,28 +727,6 @@ fn read_line_trim() -> io::Result<String> {
   Ok(buf.trim().to_string())
 }
 
-fn short_hash(h: &str) -> &str {
-  if h.len() >= 7 { &h[..7] } else { h }
-}
-
-fn run_git(args: &[&str], cwd: &Path) -> bool {
-  match std::process::Command::new("git")
-    .args(args)
-    .current_dir(cwd)
-    .stdin(Stdio::inherit())
-    .stdout(Stdio::inherit())
-    .stderr(Stdio::inherit())
-    .status()
-  {
-    Ok(s) => s.success(),
-    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-      eprintln!("{} git not installed", "error:".red().bold());
-      false
-    }
-    Err(_) => false,
-  }
-}
-
 enum RunOutcome {
   Completed,
   Interrupted,
@@ -858,11 +737,40 @@ async fn run_sandbox_iterations(
   harness: Harness,
   iterations: u32,
   st: SandboxType,
-  use_tui: bool,
 ) -> Result<RunOutcome, Error> {
-  match sandbox::run(sb, harness.as_str(), iterations, st, use_tui).await {
+  match sandbox::run(sb, harness.as_str(), iterations, st).await {
     Ok(()) => Ok(RunOutcome::Completed),
     Err(Error::Interrupted) => Ok(RunOutcome::Interrupted),
+    Err(e) => Err(e),
+  }
+}
+
+async fn continue_sandbox(sandbox_path: &Path, iterations: u32) -> Result<(), Error> {
+  let mdata = read_mdata(sandbox_path)?;
+  validate_sandbox(mdata.sandbox)?;
+
+  let original = Repository::open(sandbox_path)
+    .ok()
+    .and_then(|r| r.config().ok())
+    .and_then(|c| c.get_string("so.original").ok())
+    .map(|s| std::path::PathBuf::from(s.trim()))
+    .ok_or(Error::OriginalRepoNotFound)?;
+
+  let sb = sandbox::Sandbox { path: sandbox_path.to_path_buf(), original, task_id: mdata.task_id.clone() };
+
+  // reset status if done
+  if let Some(status) = read_status(sandbox_path)
+    && is_done(&status)
+  {
+    set_status_pending(sandbox_path)?;
+  }
+
+  match run_sandbox_iterations(&sb, mdata.harness, iterations, mdata.sandbox).await {
+    Ok(RunOutcome::Completed) => Ok(()),
+    Ok(RunOutcome::Interrupted) => {
+      println!("{}", format!("Interrupted. Sandbox kept at: {}", sb.path.display()).yellow());
+      Ok(())
+    }
     Err(e) => Err(e),
   }
 }
@@ -890,7 +798,7 @@ fn read_mdata(path: &Path) -> Result<Mdata, Error> {
   let task_id = cfg.get_string("so.mdata.task-id").ok();
   match (harness, sandbox, task_id) {
     (Some(h), Some(s), Some(t)) => Ok(Mdata { harness: h, sandbox: s, task_id: t }),
-    _ => Err(Error::Other("sandbox metadata missing, start a new run".into())),
+    _ => Err(Error::SandboxMetadataMissing),
   }
 }
 
@@ -912,226 +820,6 @@ fn parse_sandbox_type(s: &str) -> Option<SandboxType> {
 }
 
 // =============================================================================
-// Sandbox menu
-// =============================================================================
-
-async fn run_menu(sandbox: &Path, base: &str, orig: &Path, branch: &str) -> Result<(), Error> {
-  loop {
-    println!(
-      " {}iff  {}hell  {}eset  {}erge  {}ontinue  {}uit",
-      "[d]".cyan().bold(),
-      "[s]".cyan().bold(),
-      "[r]".cyan().bold(),
-      "[m]".cyan().bold(),
-      "[c]".cyan().bold(),
-      "[q]".cyan().bold()
-    );
-    print!("> ");
-    io::stdout().flush()?;
-    let input = read_line_trim()?;
-    if input.is_empty() {
-      continue;
-    }
-    let ch = input.to_lowercase().chars().next().unwrap_or(' ');
-
-    match ch {
-      'd' => {
-        let range = format!("{}..HEAD", base);
-        run_git(&["diff", &range], sandbox);
-        println!();
-      }
-      's' => {
-        let shell = match std::env::var("SHELL") {
-          Ok(s) => s,
-          Err(_) => {
-            println!(" {}", "SHELL not set".red());
-            continue;
-          }
-        };
-        println!("{}", "Entering sandbox. Type 'exit' to return".yellow());
-        match std::process::Command::new(&shell).current_dir(sandbox).status() {
-          Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!(" {}", format!("Shell not found: {}", shell).red());
-          }
-          _ => {}
-        }
-        println!();
-      }
-      'r' => {
-        println!("{}", "Commits since base:".white().bold());
-        let commits = sandbox::git_commits(sandbox, base)?;
-        if commits.is_empty() {
-          println!("  No commits to reset.\n");
-          continue;
-        }
-        for (i, (h, m)) in commits.iter().enumerate() {
-          println!("  {}. {} {}", format!("{:>2}", i + 1).cyan().bold(), short_hash(h), m);
-        }
-        println!();
-        print!("Reset to [1-{}] [q]uit ", commits.len());
-        io::stdout().flush()?;
-        let input = read_line_trim()?;
-        if input.to_lowercase() != "q"
-          && let Ok(n) = input.parse::<usize>()
-          && n >= 1
-          && n <= commits.len()
-        {
-          let (h, m) = &commits[n - 1];
-          if run_git(&["reset", "--hard", h], sandbox) {
-            println!("{}", format!("Reset to: {} {}", short_hash(h), m).green());
-          }
-        }
-        println!();
-      }
-      'm' => {
-        let cur = sandbox::git_branch(orig).unwrap_or_else(|_| "main".into());
-        let dirty = sandbox::git_dirty(orig).unwrap_or(false);
-        println!();
-        println!(" Branch: {}", cur.yellow().bold());
-        if dirty {
-          println!(" {}", "Uncommitted changes. Commit or stash first".red());
-          println!();
-          continue;
-        }
-        print!(" Merge? [y/n] ");
-        io::stdout().flush()?;
-        let yn = read_line_trim()?;
-        if !yn.to_lowercase().starts_with('y') {
-          println!("\n");
-          continue;
-        }
-        println!();
-
-        let fetch =
-          std::process::Command::new("git").args(["-C"]).arg(orig).args(["fetch"]).arg(sandbox).arg(branch).status();
-        match fetch {
-          Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!(" {}", "Git not installed".red());
-            continue;
-          }
-          Ok(s) if !s.success() => {
-            println!(" {}", "Fetch failed".red());
-            continue;
-          }
-          Err(_) => {
-            println!(" {}", "Fetch failed".red());
-            continue;
-          }
-          _ => {}
-        }
-
-        let merge =
-          std::process::Command::new("git").args(["-C"]).arg(orig).args(["merge", "--squash", "FETCH_HEAD"]).status();
-        let merge_ok = match &merge {
-          Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!(" {}", "Git not installed".red());
-            false
-          }
-          Ok(s) => s.success(),
-          Err(_) => false,
-        };
-        if merge_ok {
-          run_git(&["checkout", "HEAD", "--", ".gitignore"], orig);
-          if sandbox.join("specs").exists() {
-            let _ = sandbox::copy_dir(&sandbox.join("specs"), &orig.join("specs"));
-          }
-          let _ = std::fs::remove_dir_all(sandbox);
-          let staged = std::process::Command::new("git")
-            .args(["-C"])
-            .arg(orig)
-            .args(["diff", "--cached", "--name-only"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
-            .unwrap_or(0);
-          println!(" {}", format!("{} files staged. Sandbox cleaned", staged).green());
-        } else {
-          println!(" {}", format!("Conflict. Sandbox kept at: {}", sandbox.display()).red());
-        }
-        break;
-      }
-      'c' => {
-        if let Some(status) = read_status(sandbox)
-          && is_done(&status)
-        {
-          if let Some(pending) = task_count(sandbox) {
-            if pending > 0 {
-              set_status_pending(sandbox)?;
-            } else {
-              eprintln!("{} all tasks complete", "error:".red().bold());
-              println!();
-              continue;
-            }
-          } else {
-            eprintln!("{} all tasks complete", "error:".red().bold());
-            println!();
-            continue;
-          }
-        }
-        let mdata = match read_mdata(sandbox) {
-          Ok(m) => m,
-          Err(e) => {
-            eprintln!("{} {}", "error:".red().bold(), e);
-            println!();
-            continue;
-          }
-        };
-        print!("Iterations? [q]uit (default 10): ");
-        io::stdout().flush()?;
-        let input = read_line_trim()?;
-        let lower = input.to_lowercase();
-        if lower == "q" {
-          println!();
-          continue;
-        }
-        let n = if input.is_empty() {
-          10
-        } else {
-          match input.parse::<u32>() {
-            Ok(v) if v > 0 => v,
-            _ => {
-              println!(" {}", "invalid iterations".red());
-              println!();
-              continue;
-            }
-          }
-        };
-
-        validate_sandbox(mdata.sandbox)?;
-        let sb = sandbox::Sandbox {
-          path: sandbox.to_path_buf(),
-          original: orig.to_path_buf(),
-          branch: branch.into(),
-          task_id: mdata.task_id.clone(),
-        };
-        let start = Instant::now();
-        print_sandbox_start(mdata.harness, n, mdata.sandbox, &mdata.task_id);
-        match run_sandbox_iterations(&sb, mdata.harness, n, mdata.sandbox, false).await {
-          Ok(RunOutcome::Completed) => {
-            println!();
-            print_summary(
-              &sandbox::git_stat(&sb.path, base),
-              Some(&fmt_time(start.elapsed())),
-              Some(&sb.path.display().to_string()),
-            );
-            println!();
-          }
-          Ok(RunOutcome::Interrupted) => {
-            println!("\n{}", format!("Interrupted. Sandbox kept at: {}", sb.path.display()).yellow());
-          }
-          Err(e) => return Err(e),
-        }
-      }
-      'q' => {
-        println!("{}", format!("Sandbox kept at: {}", sandbox.display()).yellow());
-        break;
-      }
-      _ => {}
-    }
-  }
-  Ok(())
-}
-
-// =============================================================================
 // Formatting
 // =============================================================================
 
@@ -1140,34 +828,12 @@ fn fmt_time(d: Duration) -> String {
   if s >= 60 { format!("{}m {:02}s", s / 60, s % 60) } else { format!("{}s", s) }
 }
 
-fn fmt_age(mins: u64) -> String {
-  if mins < 60 {
-    format!("{}m", mins)
-  } else if mins < 1440 {
-    format!("{}h", mins / 60)
-  } else {
-    format!("{}d", mins / 1440)
-  }
-}
-
-fn print_info(msg: &str) {
-  println!("{}", format!("▶ {}", msg).yellow().bold());
-}
-
 fn print_header(harness: Harness, cur: u32, total: u32) {
   println!("{}", format!("▶ [{}] {}/{}", harness.as_str(), cur, total).cyan().bold());
 }
 
 fn print_header_time(harness: Harness, cur: u32, total: u32, time: &str) {
   println!("{}", format!("▶ [{}] {}/{} | {}", harness.as_str(), cur, total, time).cyan().bold());
-}
-
-fn print_sandbox_start(harness: Harness, n: u32, st: SandboxType, task_id: &str) {
-  println!("{}", format!("▶ Starting [{}] max={} [{}]", harness.as_str(), n, st.as_str()).green().bold());
-  if harness == Harness::Claude {
-    println!("{}", format!("  Tasks: {}", task_id).magenta());
-  }
-  println!();
 }
 
 fn print_summary(stats: &str, time: Option<&str>, path: Option<&str>) {
