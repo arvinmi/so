@@ -15,7 +15,7 @@ use clap::{
 };
 use colored::Colorize;
 use git2::Repository;
-use sandbox::SandboxType;
+use sandbox::{GpuStatus, SandboxType};
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -1144,6 +1144,10 @@ fn print_sandbox_start(harness: Harness, n: u32, st: SandboxType, task_id: &str)
   println!("{}", format!("▶ Starting [{}] max={} [{}]", harness.as_str(), n, st.as_str()).green().bold());
   if harness == Harness::Claude {
     println!("{}", format!("  Tasks: {}", task_id).magenta());
+  }
+  // warn if gpu driver present but docker toolkit missing (linux + docker only)
+  if cfg!(target_os = "linux") && st == SandboxType::Docker && sandbox::check_gpu() == GpuStatus::MissingToolkit {
+    eprintln!("{} docker gpu support not configured, running without gpu", "warning:".yellow().bold());
   }
   println!();
 }

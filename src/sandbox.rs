@@ -458,13 +458,61 @@ fn check_dir(a: &mut Vec<OsString>, created: &mut HashSet<PathBuf>, path: &Path)
 // Docker helpers
 // =============================================================================
 
-fn has_gpu() -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuStatus {
+  Available,
+  MissingToolkit,
+  NoGpu,
+}
+
+fn has_cdi_nvidia() -> bool {
+  let entries = match std::fs::read_dir("/var/run/cdi") {
+    Ok(entries) => entries,
+    Err(_) => return false,
+  };
+  for entry in entries.flatten() {
+    if let Some(name) = entry.file_name().to_str()
+      && name.contains("nvidia")
+    {
+      return true;
+    }
+  }
+  false
+}
+
+fn has_nvidia_runtime() -> bool {
+  std::process::Command::new("docker")
+    .args(["info", "--format", "{{json .Runtimes}}"])
+    .output()
+    .ok()
+    .and_then(|o| String::from_utf8(o.stdout).ok())
+    .is_some_and(|s| s.contains("nvidia"))
+}
+
+fn has_nvidia_driver() -> bool {
   std::process::Command::new("nvidia-smi")
     .stdout(std::process::Stdio::null())
     .stderr(std::process::Stdio::null())
     .status()
     .map(|s| s.success())
     .unwrap_or(false)
+}
+
+fn docker_gpu_supported() -> bool {
+  has_nvidia_runtime() || has_cdi_nvidia()
+}
+
+pub fn check_gpu() -> GpuStatus {
+  // check if nvidia-smi works (gpu driver installed)
+  if !has_nvidia_driver() {
+    return GpuStatus::NoGpu;
+  }
+  // check if docker has nvidia runtime or cdi device specs
+  if docker_gpu_supported() { GpuStatus::Available } else { GpuStatus::MissingToolkit }
+}
+
+fn has_gpu() -> bool {
+  check_gpu() == GpuStatus::Available
 }
 
 fn get_uid() -> u32 {
