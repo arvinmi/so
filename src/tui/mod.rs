@@ -158,6 +158,7 @@ pub enum FocusPane {
 pub enum HarnessEvent {
   IterationStart { n: u32 },
   IterationComplete { n: u32, diff: Option<(u32, u32)>, msg: Option<String> },
+  IterationCommitted { n: u32, msg: String },
   Activity { kind: ActivityKind, content: String },
   GitStats { files: u32, ins: u32, del: u32, commits: u32 },
   Error { message: String },
@@ -458,6 +459,11 @@ fn handle_harness_event(state: &mut AppState, event: HarnessEvent) {
     HarnessEvent::IterationComplete { n, diff, msg } => {
       state.complete_iteration(n, diff, msg);
     }
+    HarnessEvent::IterationCommitted { n, msg } => {
+      if let Some(iter) = state.iterations.get_mut((n - 1) as usize) {
+        iter.commit_msg = Some(msg);
+      }
+    }
     HarnessEvent::Activity { kind, content } => state.add_activity(kind, content),
     HarnessEvent::GitStats { files, ins, del, commits } => state.update_git_stats(files, ins, del, commits),
     HarnessEvent::Error { message } => {
@@ -518,7 +524,7 @@ fn handle_term_event(
           true
         }
         RunPopup::Continue { input } => {
-          if let Some(next) = handle_popup_continue(state, key, input)? {
+          if let Some(next) = handle_popup_continue(state, cwd, key, input)? {
             popup = next;
           }
           true
@@ -644,7 +650,12 @@ fn handle_popup_reset(
   Ok(replace)
 }
 
-fn handle_popup_continue(state: &mut AppState, key: KeyEvent, input: &mut String) -> Result<Option<RunPopup>, Error> {
+fn handle_popup_continue(
+  state: &mut AppState,
+  cwd: &Path,
+  key: KeyEvent,
+  input: &mut String,
+) -> Result<Option<RunPopup>, Error> {
   let mut replace = None;
   match key.code {
     KeyCode::Char(c) if c.is_ascii_digit() => {
@@ -656,8 +667,11 @@ fn handle_popup_continue(state: &mut AppState, key: KeyEvent, input: &mut String
       input.pop();
     }
     KeyCode::Enter => {
+      // sync iteration state with git in case of external reset
+      refresh_iterations_from_commits(state, cwd);
       let extra: u32 = input.parse().unwrap_or(10);
-      state.max_iter += extra;
+      state.max_iter = state.current_iter + extra;
+      state.iterations.truncate(state.current_iter as usize);
       for n in (state.current_iter + 1)..=(state.max_iter) {
         state.iterations.push(Iteration::new(n));
       }
@@ -754,6 +768,13 @@ async fn run_harness_loop(
     if let Err(e) = enforce_commit_tui(harness, &cwd, &tx, backend.as_ref()).await {
       let _ = tx.send(HarnessEvent::Error { message: e.to_string() });
       return;
+    }
+
+    // update iteration with commit message after successful commit
+    if let Some((_, msg)) =
+      crate::sandbox::git_commits(&cwd, crate::sandbox::BASE_TAG).ok().and_then(|c| c.into_iter().next())
+    {
+      let _ = tx.send(HarnessEvent::IterationCommitted { n: i, msg });
     }
 
     if check_status_done(&cwd) {
@@ -899,16 +920,7 @@ async fn run_codex(
 
   let mut cmd = harness_cmd(backend, cwd, "codex");
   let cfg = format!("model_reasoning_effort={effort}");
-  cmd.args([
-    "exec",
-    "--full-auto",
-    "--dangerously-bypass-approvals-and-sandbox",
-    "--model",
-    &model,
-    "--config",
-    &cfg,
-    prompt,
-  ]);
+  cmd.args(["exec", "--dangerously-bypass-approvals-and-sandbox", "--model", &model, "--config", &cfg, prompt]);
   cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
   let mut child = cmd.spawn().map_err(|e| Error::Harness(format!("codex spawn failed: {e}")))?;
