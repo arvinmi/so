@@ -19,6 +19,18 @@ use sandbox::{DockerContainer, GpuStatus, SandboxType};
 use thiserror::Error;
 use tokio::process::Command;
 
+// =============================================================================
+// Constants
+// =============================================================================
+
+const STATUS_PENDING: &str = "Status: pending\n";
+const STATUS_DONE: &str = "status: done";
+
+const SPECS_DIR: &str = "specs";
+const FILE_PROMPT: &str = "prompt.md";
+const FILE_STATUS: &str = "status.md";
+const FILE_PLAN: &str = "implementation-plan.md";
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum Harness {
   #[default]
@@ -265,11 +277,11 @@ async fn do_step(harness: Harness, iterations: u32) -> Result<(), Error> {
   let start_head = sandbox::git_head(&cwd).ok();
   let start = Instant::now();
 
-  if !cwd.join("specs/prompt.md").exists() {
+  if !cwd.join(SPECS_DIR).join(FILE_PROMPT).exists() {
     return Err(Error::NoPrompt);
   }
-  if !cwd.join("specs/status.md").exists() {
-    std::fs::write(cwd.join("specs/status.md"), "Status: pending\n")?;
+  if !cwd.join(SPECS_DIR).join(FILE_STATUS).exists() {
+    std::fs::write(cwd.join(SPECS_DIR).join(FILE_STATUS), STATUS_PENDING)?;
   }
 
   let ctx = local_ctx(&cwd);
@@ -289,7 +301,7 @@ async fn do_run(harness: Harness, iterations: u32, st: SandboxType) -> Result<()
   if sandbox::git_dirty(&cwd)? {
     return Err(Error::UncommittedChanges);
   }
-  if !cwd.join("specs/prompt.md").exists() {
+  if !cwd.join(SPECS_DIR).join(FILE_PROMPT).exists() {
     return Err(Error::NoPrompt);
   }
 
@@ -359,13 +371,13 @@ async fn run_with_prompt(
 
 async fn do_plan(harness: Harness) -> Result<(), Error> {
   let cwd = std::env::current_dir()?;
-  let specs = cwd.join("specs");
+  let specs = cwd.join(SPECS_DIR);
   std::fs::create_dir_all(&specs)?;
 
   write_if_missing(&specs.join("readme.md"), include_str!("templates/readme.md"))?;
-  write_if_missing(&specs.join("implementation-plan.md"), include_str!("templates/implementation-plan.md"))?;
-  write_if_missing(&specs.join("prompt.md"), include_str!("templates/prompt.md"))?;
-  write_if_missing(&specs.join("status.md"), "Status: pending\n")?;
+  write_if_missing(&specs.join(FILE_PLAN), include_str!("templates/implementation-plan.md"))?;
+  write_if_missing(&specs.join(FILE_PROMPT), include_str!("templates/prompt.md"))?;
+  write_if_missing(&specs.join(FILE_STATUS), STATUS_PENDING)?;
   write_if_missing(&cwd.join("Dockerfile.sandbox"), include_str!("templates/Dockerfile.sandbox"))?;
 
   let prompt = r#"PLANNING ONLY. DO NOT IMPLEMENT.
@@ -511,10 +523,7 @@ async fn do_menu() -> Result<(), Error> {
         continue;
       }
       if choice_lower == "a" {
-        print!("Delete all {} sandboxes? [y/n] ", all.len());
-        io::stdout().flush()?;
-        let yn = read_line_trim()?;
-        if yn.to_lowercase().starts_with('y') {
+        if confirm(&format!("Delete all {} sandboxes?", all.len()))? {
           for sb in &all {
             let _ = std::fs::remove_dir_all(&sb.path);
           }
@@ -530,10 +539,7 @@ async fn do_menu() -> Result<(), Error> {
       {
         let project = &project_names[n - 1];
         let group = projects.get(project).cloned().unwrap_or_default();
-        print!("Delete {} sandboxes for \"{}\"? [y/n] ", group.len(), project);
-        io::stdout().flush()?;
-        let yn = read_line_trim()?;
-        if yn.to_lowercase().starts_with('y') {
+        if confirm(&format!("Delete {} sandboxes for \"{}\"?", group.len(), project))? {
           for sb in group {
             let _ = std::fs::remove_dir_all(&sb.path);
           }
@@ -568,8 +574,8 @@ async fn do_menu() -> Result<(), Error> {
 
 async fn run_loop(mode: RunMode, harness: Harness, max: u32, ctx: &ExecContext<'_>) -> Result<(), Error> {
   let cwd = ctx.sandbox_path();
-  let prompt_path = cwd.join("specs/prompt.md");
-  let status_path = cwd.join("specs/status.md");
+  let prompt_path = cwd.join(SPECS_DIR).join(FILE_PROMPT);
+  let status_path = cwd.join(SPECS_DIR).join(FILE_STATUS);
   let unattended = std::env::var("SO_UNATTENDED").is_ok();
   let effective_max = effective_max(cwd, max);
 
@@ -580,7 +586,7 @@ async fn run_loop(mode: RunMode, harness: Harness, max: u32, ctx: &ExecContext<'
         if !status.is_empty() {
           println!("{}", status);
         }
-        if status.to_lowercase().contains("status: done") {
+        if is_done(status) {
           println!("All tasks complete.");
         }
       }
@@ -608,10 +614,7 @@ async fn run_loop(mode: RunMode, harness: Harness, max: u32, ctx: &ExecContext<'
 
     if i < effective_max {
       if mode == RunMode::Step {
-        print!("Continue? [y/n] ");
-        io::stdout().flush()?;
-        let yn = read_line_trim()?;
-        if !yn.to_lowercase().starts_with('y') {
+        if !confirm("Continue?")? {
           println!("\nStopped.");
           break;
         }
@@ -625,7 +628,7 @@ async fn run_loop(mode: RunMode, harness: Harness, max: u32, ctx: &ExecContext<'
 }
 
 fn task_count(cwd: &Path) -> Option<u32> {
-  let plan = cwd.join("specs/implementation-plan.md");
+  let plan = cwd.join(SPECS_DIR).join(FILE_PLAN);
   let content = std::fs::read_to_string(plan).ok()?;
   let count = content.lines().filter(|l| l.trim_start().starts_with("- [ ]")).count();
   if count == 0 { None } else { Some(count as u32) }
@@ -826,26 +829,25 @@ async fn enforce_commit(harness: Harness, ctx: &ExecContext<'_>) {
 }
 
 fn check_status(cwd: &Path) -> Result<bool, Error> {
-  let p = cwd.join("specs/status.md");
+  let p = cwd.join(SPECS_DIR).join(FILE_STATUS);
   if !p.exists() {
     return Ok(false);
   }
   let c = std::fs::read_to_string(&p)?.to_lowercase();
-  Ok(c.contains("status: done"))
+  Ok(c.contains(STATUS_DONE))
 }
 
 fn read_status(cwd: &Path) -> Option<String> {
-  let p = cwd.join("specs/status.md");
+  let p = cwd.join(SPECS_DIR).join(FILE_STATUS);
   std::fs::read_to_string(&p).ok().map(|s| s.trim().to_string())
 }
 
 fn is_done(status: &str) -> bool {
-  let s = status.to_lowercase();
-  s.contains("status: done")
+  status.to_lowercase().contains(STATUS_DONE)
 }
 
 fn set_status_pending(cwd: &Path) -> Result<(), Error> {
-  std::fs::write(cwd.join("specs/status.md"), "Status: pending\n")?;
+  std::fs::write(cwd.join(SPECS_DIR).join(FILE_STATUS), STATUS_PENDING)?;
   Ok(())
 }
 
@@ -893,6 +895,12 @@ fn read_line_trim() -> io::Result<String> {
   let mut buf = String::new();
   io::stdin().read_line(&mut buf)?;
   Ok(buf.trim().to_string())
+}
+
+fn confirm(msg: &str) -> io::Result<bool> {
+  print!("{} [y/n] ", msg);
+  io::stdout().flush()?;
+  Ok(read_line_trim()?.to_lowercase().starts_with('y'))
 }
 
 fn short_hash(h: &str) -> &str {
@@ -1071,11 +1079,8 @@ async fn run_menu(sandbox: &Path, base: &str, orig: &Path, branch: &str) -> Resu
           println!();
           continue;
         }
-        print!(" Merge? [y/n] ");
-        io::stdout().flush()?;
-        let yn = read_line_trim()?;
-        if !yn.to_lowercase().starts_with('y') {
-          println!("\n");
+        if !confirm(" Merge?")? {
+          println!();
           continue;
         }
         println!();
@@ -1199,10 +1204,7 @@ async fn run_menu(sandbox: &Path, base: &str, orig: &Path, branch: &str) -> Resu
           Err(e) => return Err(e),
         }
       }
-      'q' => {
-        println!("{}", format!("Sandbox kept at: {}", sandbox.display()).yellow());
-        break;
-      }
+      'q' => break,
       _ => {}
     }
   }
