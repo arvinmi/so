@@ -869,18 +869,17 @@ async fn finalize_sandbox(
   st: SandboxType,
 ) -> Result<(), Error> {
   match run_sandbox_iterations(sb, harness, iterations, st).await {
-    Ok(RunOutcome::Completed) => {
+    Ok(outcome) => {
       println!();
+      if matches!(outcome, RunOutcome::Interrupted) {
+        println!("{}", "Interrupted.".yellow());
+      }
       print_summary(
         &sandbox::git_stat(&sb.path, sandbox::BASE_TAG),
         Some(&fmt_time(start.elapsed())),
         Some(&sb.path.display().to_string()),
       );
       run_menu(&sb.path, sandbox::BASE_TAG, cwd, &sb.branch).await?;
-      Ok(())
-    }
-    Ok(RunOutcome::Interrupted) => {
-      println!("\n{}", format!("Interrupted. Sandbox kept at: {}", sb.path.display()).yellow());
       Ok(())
     }
     Err(e) => {
