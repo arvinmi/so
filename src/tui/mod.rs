@@ -908,7 +908,16 @@ async fn run_codex(
 
   let mut cmd = harness_cmd(backend, cwd, "codex");
   let cfg = format!("model_reasoning_effort={effort}");
-  cmd.args(["exec", "--full-auto", prompt, "--model", &model, "--config", &cfg]);
+  cmd.args([
+    "exec",
+    "--full-auto",
+    "--dangerously-bypass-approvals-and-sandbox",
+    prompt,
+    "--model",
+    &model,
+    "--config",
+    &cfg,
+  ]);
   cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
   let mut child = cmd.spawn().map_err(|e| Error::Harness(format!("codex spawn failed: {e}")))?;
