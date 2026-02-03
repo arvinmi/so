@@ -32,6 +32,13 @@ impl SandboxType {
   }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum Mode {
+  Run,
+  Clean,
+  Dup,
+}
+
 fn project_name(p: &Path) -> &OsStr {
   p.file_name().unwrap_or_else(|| OsStr::new("project"))
 }
@@ -39,13 +46,6 @@ fn project_name(p: &Path) -> &OsStr {
 // =============================================================================
 // Sandbox
 // =============================================================================
-
-#[derive(Debug, Clone, Copy)]
-pub enum Mode {
-  Run,
-  Clean,
-  Dup,
-}
 
 pub struct Sandbox {
   pub path: PathBuf,
@@ -173,24 +173,147 @@ pub fn list() -> Result<Vec<Info>, Error> {
 }
 
 // =============================================================================
-// Run
+// Docker
 // =============================================================================
 
-pub async fn run(sb: &Sandbox, harness: &str, iterations: u32, st: SandboxType) -> Result<(), Error> {
-  match st {
-    SandboxType::Bwrap => run_bwrap(sb, harness, iterations).await,
-    SandboxType::Docker => run_docker(sb, harness, iterations).await,
+pub struct DockerContainer {
+  pub id: String,
+  pub workdir: String,
+  exec_user: Option<String>,
+  creds: PathBuf,
+}
+
+impl DockerContainer {
+  pub fn exec_cmd_tty(&self, program: &str, tty: bool) -> Command {
+    let mut cmd = Command::new("docker");
+    if tty {
+      cmd.args(["exec", "-it"]);
+    } else {
+      cmd.args(["exec", "-i"]);
+    }
+    if let Some(user) = &self.exec_user {
+      cmd.args(["-u", user]);
+    }
+    cmd.args(["-w", &self.workdir, &self.id, program]);
+    cmd
+  }
+
+  pub async fn stop(&self) {
+    let _ = Command::new("docker").args(["stop", "-t", "2", &self.id]).output().await;
+    let _ = Command::new("docker").args(["rm", "-f", &self.id]).output().await;
+    let _ = std::fs::remove_dir_all(&self.creds);
   }
 }
 
-async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), Error> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuStatus {
+  Available,
+  MissingToolkit,
+  NoGpu,
+}
+
+pub fn check_gpu() -> GpuStatus {
+  if !has_nvidia_driver() {
+    return GpuStatus::NoGpu;
+  }
+  if has_nvidia_runtime() || has_cdi_nvidia() { GpuStatus::Available } else { GpuStatus::MissingToolkit }
+}
+
+fn has_gpu() -> bool {
+  check_gpu() == GpuStatus::Available
+}
+
+fn has_nvidia_driver() -> bool {
+  std::process::Command::new("nvidia-smi")
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false)
+}
+
+fn has_nvidia_runtime() -> bool {
+  std::process::Command::new("docker")
+    .args(["info", "--format", "{{json .Runtimes}}"])
+    .output()
+    .ok()
+    .and_then(|o| String::from_utf8(o.stdout).ok())
+    .is_some_and(|s| s.contains("nvidia"))
+}
+
+fn has_cdi_nvidia() -> bool {
+  std::fs::read_dir("/var/run/cdi")
+    .into_iter()
+    .flatten()
+    .flatten()
+    .any(|e| e.file_name().to_str().is_some_and(|n| n.contains("nvidia")))
+}
+
+fn get_uid() -> u32 {
+  unsafe { libc::getuid() }
+}
+
+fn get_gid() -> u32 {
+  unsafe { libc::getgid() }
+}
+
+async fn image_is_fresh(image: &str, dockerfile: &Path) -> bool {
+  let created = Command::new("docker")
+    .args(["inspect", "-f", "{{.Created}}", image])
+    .output()
+    .await
+    .ok()
+    .and_then(|o| String::from_utf8(o.stdout).ok())
+    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+    .map(|dt| dt.with_timezone(&chrono::Utc));
+  let modified =
+    std::fs::metadata(dockerfile).ok().and_then(|m| m.modified().ok()).map(chrono::DateTime::<chrono::Utc>::from);
+  matches!((created, modified), (Some(c), Some(m)) if c >= m)
+}
+
+fn mount_creds(cmd: &mut Command, creds: &Path, home: &str) {
+  let gc = creds.join(".gitconfig");
+  if gc.exists() {
+    cmd.arg("-v").arg(format!("{}:{}/.gitconfig:ro", gc.display(), home));
+  }
+  for (src, dst) in [
+    (".claude", ".claude"),
+    (".claude.json", ".claude.json"),
+    (".codex", ".codex"),
+    (".config/opencode", ".config/opencode"),
+    (".local/share/opencode", ".local/share/opencode"),
+    (".local/state/opencode", ".local/state/opencode"),
+  ] {
+    let p = creds.join(src);
+    if p.exists() {
+      cmd.arg("-v").arg(format!("{}:{}/{}", p.display(), home, dst));
+    }
+  }
+}
+
+fn add_env(cmd: &mut Command, key: &str, value: &str) {
+  cmd.args(["-e", &format!("{}={}", key, value)]);
+}
+
+fn add_env_if_set(cmd: &mut Command, key: &str) {
+  if let Ok(value) = std::env::var(key) {
+    add_env(cmd, key, &value);
+  }
+}
+
+fn add_user(cmd: &mut Command) {
+  if cfg!(target_os = "linux") {
+    cmd.arg("--user").arg(format!("{}:{}", get_uid(), get_gid()));
+  }
+}
+
+pub async fn start_docker(sb: &Sandbox) -> Result<DockerContainer, Error> {
   let project = project_name(&sb.original).to_string_lossy();
   let dockerfile = sb.original.join("Dockerfile.sandbox");
   if !dockerfile.exists() {
     return Err(Error::NoDockerfile);
   }
 
-  // use `/home/ubuntu` to closly match host config
   let home = "/home/ubuntu".to_string();
   let code = format!("{}/{}", home, project);
   let image = format!("sandbox-{}", project.to_lowercase());
@@ -199,8 +322,7 @@ async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), 
   if !image_is_fresh(&image, &dockerfile).await {
     log_activity(sb, "sandbox: building image")?;
     let mut cmd = Command::new("docker");
-    cmd.args(["build", "-q"]);
-    cmd.args(["-t", &image, "-f"]).arg(&dockerfile).arg(&sb.original);
+    cmd.args(["build", "-q", "-t", &image, "-f"]).arg(&dockerfile).arg(&sb.original);
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     if !cmd.status().await?.success() {
       return Err(Error::Docker("build failed".into()));
@@ -211,82 +333,67 @@ async fn run_docker(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), 
   }
 
   let creds = setup_creds()?;
-
   let mut cmd = Command::new("docker");
-  // use -t only if we have a real tty, otherwise just -i for stdin
-  if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-    cmd.args(["run", "-it", "--rm", "--network", "host"]);
-  } else {
-    cmd.args(["run", "-i", "--rm", "--network", "host"]);
-  }
+  cmd.args(["run", "-d", "--network", "host"]);
 
-  // pass gpu if available (linux only)
   if cfg!(target_os = "linux") && has_gpu() {
     cmd.args(["--gpus", "all"]);
   }
 
-  // run as host user for credential file access
-  cmd.arg("--user").arg(format!("{}:{}", get_uid(), get_gid()));
-
-  // mounts
+  add_user(&mut cmd);
   cmd.args(["-v", "/etc/localtime:/etc/localtime:ro"]);
   cmd.arg("-v").arg(format!("{}:{}", sb.path.display(), code));
-  let so_dir = std::env::current_exe()
-    .ok()
-    .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-    .unwrap_or_else(|| PathBuf::from("/usr/local/bin"));
-  cmd.arg("-v").arg(format!("{}:/opt/so:ro", so_dir.display()));
+
   let gc = sb.path.join(".git/config");
   if gc.exists() {
     cmd.arg("-v").arg(format!("{}:{}/.git/config:ro", gc.display(), code));
   }
 
-  // credentials
   mount_creds(&mut cmd, &creds, &home);
 
-  // env
-  cmd.args(["-e", &format!("CLAUDE_CODE_TASK_LIST_ID={}", sb.task_id)]);
-  cmd.args(["-e", "SO_UNATTENDED=1"]);
-  cmd.args(["-e", &format!("HOME={}", home)]);
-  cmd.args(["-e", &format!("XDG_CONFIG_HOME={}/.config", home)]);
-  cmd.args(["-e", &format!("XDG_DATA_HOME={}/.local/share", home)]);
-  if let Ok(m) = std::env::var("MODEL") {
-    cmd.args(["-e", &format!("MODEL={}", m)]);
-  }
-  if let Ok(e) = std::env::var("EFFORT") {
-    cmd.args(["-e", &format!("EFFORT={}", e)]);
-  }
-  cmd.args(["-e", "SO_TUI=1"]);
+  add_env(&mut cmd, "CLAUDE_CODE_TASK_LIST_ID", &sb.task_id);
+  add_env(&mut cmd, "SO_UNATTENDED", "1");
+  add_env(&mut cmd, "SO_TUI", "1");
+  add_env(&mut cmd, "HOME", &home);
+  add_env(&mut cmd, "XDG_CONFIG_HOME", &format!("{}/.config", home));
+  add_env(&mut cmd, "XDG_DATA_HOME", &format!("{}/.local/share", home));
+  add_env(&mut cmd, "OPENCODE_PERMISSION", r#"{"*":"allow"}"#);
+  add_env_if_set(&mut cmd, "MODEL");
+  add_env_if_set(&mut cmd, "EFFORT");
 
   cmd.args(["-w", &code]).arg(&image);
-  cmd.args(["/opt/so/so", "-H", harness, "step"]);
-  cmd.args(["-i", &iterations.to_string()]);
-  cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+  cmd.args(["tail", "-f", "/dev/null"]);
+  cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
 
-  let child = match cmd.spawn() {
-    Ok(c) => c,
+  let output = match cmd.output().await {
+    Ok(o) => o,
     Err(e) => {
       let _ = std::fs::remove_dir_all(&creds);
       return Err(Error::Docker(format!("spawn failed: {}", e)));
     }
   };
-  let result = wait_with_ctrl_c(child).await;
-  let _ = std::fs::remove_dir_all(&creds);
-  let status = match result {
-    Ok(s) => s,
-    Err(e) => return Err(e),
-  };
-  if !status.success() {
-    // check ctrl+c (SIGINT) exit code was pressed
-    if status.code() == Some(130) {
-      return Err(Error::Interrupted);
-    }
-    return Err(Error::Docker("container failed".into()));
+
+  if !output.status.success() {
+    let _ = std::fs::remove_dir_all(&creds);
+    return Err(Error::Docker("container start failed".into()));
   }
-  Ok(())
+
+  let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+  if id.is_empty() {
+    let _ = std::fs::remove_dir_all(&creds);
+    return Err(Error::Docker("no container id returned".into()));
+  }
+
+  let exec_user = if cfg!(target_os = "linux") { None } else { Some("1000:1000".into()) };
+
+  Ok(DockerContainer { id, workdir: code, exec_user, creds })
 }
 
-async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), Error> {
+// =============================================================================
+// Bwrap (linux only)
+// =============================================================================
+
+pub async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), Error> {
   let home = dirs::home_dir().ok_or(Error::NoHome)?;
   let code = home.join(project_name(&sb.original));
   let creds = setup_creds()?;
@@ -370,7 +477,7 @@ async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), E
   push_path(&mut a, &sb.path);
   push_path(&mut a, &code);
 
-  // set so binary
+  // so binary
   let so_dir = std::env::current_exe()
     .ok()
     .and_then(|p| p.parent().map(|p| p.to_path_buf()))
@@ -404,37 +511,19 @@ async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), E
 
   // env
   let h = home.display().to_string();
-  push_arg(&mut a, "--setenv");
-  push_arg(&mut a, "HOME");
-  push_arg(&mut a, &h);
-  push_arg(&mut a, "--setenv");
-  push_arg(&mut a, "PATH");
-  push_arg(&mut a, &path);
-  push_arg(&mut a, "--setenv");
-  push_arg(&mut a, "CLAUDE_CODE_TASK_LIST_ID");
-  push_arg(&mut a, &sb.task_id);
-  push_arg(&mut a, "--setenv");
-  push_arg(&mut a, "SO_UNATTENDED");
-  push_arg(&mut a, "1");
-  push_arg(&mut a, "--setenv");
-  push_arg(&mut a, "TMPDIR");
-  push_arg(&mut a, "/tmp");
-  push_arg(&mut a, "--setenv");
-  push_arg(&mut a, "UV_CACHE_DIR");
-  push_arg(&mut a, &format!("{}/.cache/uv", h));
-  if let Ok(m) = std::env::var("MODEL") {
-    push_arg(&mut a, "--setenv");
-    push_arg(&mut a, "MODEL");
-    push_arg(&mut a, &m);
+  for (k, v) in [
+    ("HOME", h.as_str()),
+    ("PATH", &path),
+    ("CLAUDE_CODE_TASK_LIST_ID", &sb.task_id),
+    ("SO_UNATTENDED", "1"),
+    ("TMPDIR", "/tmp"),
+    ("UV_CACHE_DIR", &format!("{}/.cache/uv", h)),
+  ] {
+    push_env(&mut a, k, v);
   }
-  if let Ok(e) = std::env::var("EFFORT") {
-    push_arg(&mut a, "--setenv");
-    push_arg(&mut a, "EFFORT");
-    push_arg(&mut a, &e);
-  }
-  push_arg(&mut a, "--setenv");
-  push_arg(&mut a, "SO_TUI");
-  push_arg(&mut a, "1");
+  push_env(&mut a, "SO_TUI", "1");
+  push_env_if_set(&mut a, "MODEL");
+  push_env_if_set(&mut a, "EFFORT");
 
   push_arg(&mut a, "--chdir");
   push_path(&mut a, &code);
@@ -448,6 +537,7 @@ async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), E
 
   let mut cmd = Command::new("bwrap");
   cmd.args(a.iter().map(|p| p.as_os_str())).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+
   let child = match cmd.spawn() {
     Ok(c) => c,
     Err(e) => {
@@ -455,25 +545,17 @@ async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), E
       return Err(Error::BwrapSpawn(e.to_string()));
     }
   };
+
   let result = wait_with_ctrl_c(child).await;
   let _ = std::fs::remove_dir_all(&creds);
-  let status = match result {
-    Ok(s) => s,
-    Err(e) => return Err(e),
-  };
-  if !status.success() {
-    // check ctrl+c (SIGINT) exit code was pressed
-    if status.code() == Some(130) {
-      return Err(Error::Interrupted);
-    }
-    return Err(Error::BwrapExit(status.code().unwrap_or(-1)));
-  }
-  Ok(())
-}
 
-// =============================================================================
-// Bwrap helpers
-// =============================================================================
+  match result {
+    Ok(s) if s.success() => Ok(()),
+    Ok(s) if s.code() == Some(130) => Err(Error::Interrupted),
+    Ok(s) => Err(Error::BwrapExit(s.code().unwrap_or(-1))),
+    Err(e) => Err(e),
+  }
+}
 
 fn push_arg(a: &mut Vec<OsString>, s: &str) {
   a.push(OsString::from(s));
@@ -481,6 +563,18 @@ fn push_arg(a: &mut Vec<OsString>, s: &str) {
 
 fn push_path(a: &mut Vec<OsString>, p: &Path) {
   a.push(p.as_os_str().to_os_string());
+}
+
+fn push_env(a: &mut Vec<OsString>, key: &str, value: &str) {
+  push_arg(a, "--setenv");
+  push_arg(a, key);
+  push_arg(a, value);
+}
+
+fn push_env_if_set(a: &mut Vec<OsString>, key: &str) {
+  if let Ok(value) = std::env::var(key) {
+    push_env(a, key, &value);
+  }
 }
 
 fn ro(a: &mut Vec<OsString>, p: &Path) {
@@ -517,62 +611,6 @@ fn check_dir(a: &mut Vec<OsString>, created: &mut HashSet<PathBuf>, path: &Path)
 }
 
 // =============================================================================
-// Docker helpers
-// =============================================================================
-
-fn has_gpu() -> bool {
-  std::process::Command::new("nvidia-smi")
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null())
-    .status()
-    .map(|s| s.success())
-    .unwrap_or(false)
-}
-
-fn get_uid() -> u32 {
-  unsafe { libc::getuid() }
-}
-fn get_gid() -> u32 {
-  unsafe { libc::getgid() }
-}
-
-async fn image_is_fresh(image: &str, dockerfile: &Path) -> bool {
-  let created = Command::new("docker")
-    .args(["inspect", "-f", "{{.Created}}", image])
-    .output()
-    .await
-    .ok()
-    .and_then(|o| String::from_utf8(o.stdout).ok())
-    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
-    .map(|dt| dt.with_timezone(&chrono::Utc));
-  let modified =
-    std::fs::metadata(dockerfile).ok().and_then(|m| m.modified().ok()).map(chrono::DateTime::<chrono::Utc>::from);
-  match (created, modified) {
-    (Some(c), Some(m)) => c >= m,
-    _ => false,
-  }
-}
-
-fn mount_creds(cmd: &mut Command, creds: &Path, home: &str) {
-  let gc = creds.join(".gitconfig");
-  if gc.exists() {
-    cmd.arg("-v").arg(format!("{}:{}/.gitconfig:ro", gc.display(), home));
-  }
-  for (src, dst) in [
-    (".claude", ".claude"),
-    (".claude.json", ".claude.json"),
-    (".codex", ".codex"),
-    (".config/opencode", ".config/opencode"),
-    (".local/share/opencode", ".local/share/opencode"),
-  ] {
-    let p = creds.join(src);
-    if p.exists() {
-      cmd.arg("-v").arg(format!("{}:{}/{}", p.display(), home, dst));
-    }
-  }
-}
-
-// =============================================================================
 // Credentials
 // =============================================================================
 
@@ -582,6 +620,7 @@ fn setup_creds() -> Result<PathBuf, Error> {
   std::fs::create_dir_all(&creds)?;
   std::fs::create_dir_all(creds.join(".config"))?;
   std::fs::create_dir_all(creds.join(".local/share"))?;
+  std::fs::create_dir_all(creds.join(".local/state/opencode"))?;
 
   std::fs::write(
     creds.join(".gitconfig"),
@@ -607,6 +646,20 @@ fn setup_creds() -> Result<PathBuf, Error> {
   copy_filtered(&home.join(".local/share/opencode"), &creds.join(".local/share/opencode"), &[])?;
   if home.join(".claude.json").exists() {
     std::fs::copy(home.join(".claude.json"), creds.join(".claude.json"))?;
+  }
+
+  // for macos, claude stores credentials in keychain, extract them for docker
+  #[cfg(target_os = "macos")]
+  if let Some(output) = std::process::Command::new("security")
+    .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+    .output()
+    .ok()
+    .filter(|o| o.status.success())
+    .filter(|_| !creds.join(".claude/.credentials.json").exists())
+  {
+    let claude_dir = creds.join(".claude");
+    let _ = std::fs::create_dir_all(&claude_dir);
+    let _ = std::fs::write(claude_dir.join(".credentials.json"), &output.stdout);
   }
 
   Ok(creds)

@@ -1,6 +1,6 @@
 [package]
-name = "so"
-version = "0.1.0"
+name = "sono"
+version = "0.1.1"
 edition = "2024"
 description = "Sandbox for your agents"
 authors = ["Arvin <hello@arvinmir.com>"]
@@ -10,16 +10,19 @@ readme = "README.md"
 keywords = ["cli", "agent"]
 categories = ["development-tools", "command-line-utilities"]
 
+[[bin]]
+name = "so"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "io-util", "signal", "sync"] }
 thiserror = "2"
 git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
 colored = "3"
 chrono = "0.4"
 dirs = "6"
 serde_json = "1"
-console = "0.16"
 libc = "0.2"
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
