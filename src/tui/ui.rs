@@ -56,6 +56,15 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     RunPopup::Options => render_options_popup(frame, area, state),
     RunPopup::Reset { commits, selected } => super::popup::render_reset_popup(frame, area, commits, *selected),
     RunPopup::Continue { input } => super::popup::render_continue_popup(frame, area, input),
+    RunPopup::MergeConfirm { orig } => super::popup::render_merge_popup(
+      frame,
+      area,
+      orig,
+      state.files_changed,
+      state.insertions,
+      state.deletions,
+      state.commit_count,
+    ),
     RunPopup::Error { message } => super::popup::render_error_popup(frame, area, message),
   }
 }
@@ -248,8 +257,8 @@ fn render_activity_section(frame: &mut Frame, area: Rect, state: &AppState) {
   let list = List::new(fill_list(items, visible_height, width));
   frame.render_widget(list, content_area);
 
-  // footer: └ ^C quit │ ^D diff │ ^S shell │ ↑↓ scroll ─────────┘
-  let keys = " ^C quit │ ^D diff │ ^S shell │ ↑↓ scroll ";
+  // footer: └ ^C quit │ ↑↓ scroll ─────────┘
+  let keys = " ^C quit │ ↑↓ scroll ";
 
   frame.render_widget(Paragraph::new(box_footer_keys(keys, width, BORDER_GRAY)), footer_area);
 }

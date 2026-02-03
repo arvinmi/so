@@ -7,10 +7,7 @@ use std::{
 
 use colored::Colorize;
 use git2::{Repository, StatusOptions};
-use tokio::{
-  process::{Child, Command},
-  signal,
-};
+use tokio::process::Command;
 
 use crate::Error;
 
@@ -199,7 +196,7 @@ impl DockerContainer {
   }
 
   pub async fn stop(&self) {
-    let _ = Command::new("docker").args(["stop", "-t", "2", &self.id]).output().await;
+    let _ = Command::new("docker").args(["stop", "-t", "0", &self.id]).output().await;
     let _ = Command::new("docker").args(["rm", "-f", &self.id]).output().await;
     let _ = std::fs::remove_dir_all(&self.creds);
   }
@@ -353,7 +350,6 @@ pub async fn start_docker(sb: &Sandbox) -> Result<DockerContainer, Error> {
 
   add_env(&mut cmd, "CLAUDE_CODE_TASK_LIST_ID", &sb.task_id);
   add_env(&mut cmd, "SO_UNATTENDED", "1");
-  add_env(&mut cmd, "SO_TUI", "1");
   add_env(&mut cmd, "HOME", &home);
   add_env(&mut cmd, "XDG_CONFIG_HOME", &format!("{}/.config", home));
   add_env(&mut cmd, "XDG_DATA_HOME", &format!("{}/.local/share", home));
@@ -393,12 +389,33 @@ pub async fn start_docker(sb: &Sandbox) -> Result<DockerContainer, Error> {
 // Bwrap (linux only)
 // =============================================================================
 
-pub async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(), Error> {
+pub struct BwrapContext {
+  args: Vec<OsString>,
+  chdir: PathBuf,
+  creds: PathBuf,
+}
+
+impl BwrapContext {
+  pub fn new(sb: &Sandbox) -> Result<Self, Error> {
+    let (args, chdir, creds) = build_bwrap_args(sb)?;
+    Ok(Self { args, chdir, creds })
+  }
+
+  pub fn cmd(&self, program: &str) -> Command {
+    bwrap_command(&self.args, &self.chdir, program)
+  }
+}
+
+impl Drop for BwrapContext {
+  fn drop(&mut self) {
+    let _ = std::fs::remove_dir_all(&self.creds);
+  }
+}
+
+fn build_bwrap_args(sb: &Sandbox) -> Result<(Vec<OsString>, PathBuf, PathBuf), Error> {
   let home = dirs::home_dir().ok_or(Error::NoHome)?;
   let code = home.join(project_name(&sb.original));
   let creds = setup_creds()?;
-
-  log_activity(sb, "sandbox: starting bwrap")?;
 
   let mut a: Vec<OsString> = Vec::new();
   let mut created_dirs: HashSet<PathBuf> = HashSet::new();
@@ -515,46 +532,25 @@ pub async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(
     ("HOME", h.as_str()),
     ("PATH", &path),
     ("CLAUDE_CODE_TASK_LIST_ID", &sb.task_id),
-    ("SO_UNATTENDED", "1"),
     ("TMPDIR", "/tmp"),
     ("UV_CACHE_DIR", &format!("{}/.cache/uv", h)),
   ] {
     push_env(&mut a, k, v);
   }
-  push_env(&mut a, "SO_TUI", "1");
   push_env_if_set(&mut a, "MODEL");
   push_env_if_set(&mut a, "EFFORT");
 
-  push_arg(&mut a, "--chdir");
-  push_path(&mut a, &code);
-  push_arg(&mut a, "--");
-  push_arg(&mut a, "/opt/so/so");
-  push_arg(&mut a, "-H");
-  push_arg(&mut a, harness);
-  push_arg(&mut a, "step");
-  push_arg(&mut a, "-i");
-  push_arg(&mut a, &iterations.to_string());
+  Ok((a, code, creds))
+}
 
+fn bwrap_command(args: &[OsString], chdir: &Path, program: &str) -> Command {
   let mut cmd = Command::new("bwrap");
-  cmd.args(a.iter().map(|p| p.as_os_str())).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
-
-  let child = match cmd.spawn() {
-    Ok(c) => c,
-    Err(e) => {
-      let _ = std::fs::remove_dir_all(&creds);
-      return Err(Error::BwrapSpawn(e.to_string()));
-    }
-  };
-
-  let result = wait_with_ctrl_c(child).await;
-  let _ = std::fs::remove_dir_all(&creds);
-
-  match result {
-    Ok(s) if s.success() => Ok(()),
-    Ok(s) if s.code() == Some(130) => Err(Error::Interrupted),
-    Ok(s) => Err(Error::BwrapExit(s.code().unwrap_or(-1))),
-    Err(e) => Err(e),
-  }
+  cmd.args(args.iter().map(|p| p.as_os_str()));
+  cmd.arg("--chdir");
+  cmd.arg(chdir);
+  cmd.arg("--");
+  cmd.arg(program);
+  cmd
 }
 
 fn push_arg(a: &mut Vec<OsString>, s: &str) {
@@ -901,17 +897,6 @@ pub fn copy_dir(src: &Path, dst: &Path) -> Result<(), Error> {
     }
   }
   Ok(())
-}
-
-async fn wait_with_ctrl_c(mut child: Child) -> Result<std::process::ExitStatus, Error> {
-  tokio::select! {
-    res = child.wait() => Ok(res?),
-    _ = signal::ctrl_c() => {
-      let _ = child.kill().await;
-      let _ = child.wait().await;
-      Err(Error::Interrupted)
-    }
-  }
 }
 
 #[cfg(unix)]

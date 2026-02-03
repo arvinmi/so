@@ -3,9 +3,10 @@ mod tui;
 
 use std::{
   cmp::min,
-  io::{self, IsTerminal, Write},
+  io::{self, Write},
   path::Path,
   process::Stdio,
+  sync::Arc,
   time::{Duration, Instant},
 };
 
@@ -15,7 +16,7 @@ use clap::{
 };
 use colored::Colorize;
 use git2::Repository;
-use sandbox::{DockerContainer, GpuStatus, SandboxType};
+use sandbox::{GpuStatus, SandboxType};
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -183,7 +184,6 @@ pub enum RunMode {
 
 enum ExecContext<'a> {
   Local { cwd: &'a Path },
-  Docker { container: &'a DockerContainer, sandbox_path: &'a Path },
 }
 
 impl<'a> ExecContext<'a> {
@@ -191,21 +191,19 @@ impl<'a> ExecContext<'a> {
     self.cmd_tty(program, false)
   }
 
-  fn cmd_tty(&self, program: &str, tty: bool) -> Command {
+  fn cmd_tty(&self, program: &str, _tty: bool) -> Command {
     match self {
       Self::Local { cwd } => {
         let mut c = Command::new(program);
         c.current_dir(cwd);
         c
       }
-      Self::Docker { container, .. } => container.exec_cmd_tty(program, tty && std::io::stdin().is_terminal()),
     }
   }
 
   fn sandbox_path(&self) -> &Path {
     match self {
       Self::Local { cwd } => cwd,
-      Self::Docker { sandbox_path, .. } => sandbox_path,
     }
   }
 }
@@ -333,7 +331,7 @@ async fn do_step(harness: Harness, iterations: u32) -> Result<(), Error> {
   let ctx = local_ctx(&cwd);
   if use_tui {
     let name = cwd.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "sandbox".into());
-    tui::run(name, harness, mode, effective_max, cwd.clone()).await?;
+    tui::run(name, harness, mode, effective_max, cwd.clone(), None).await?;
   } else {
     run_loop(mode, harness, effective_max, &ctx).await?;
   }
@@ -814,10 +812,7 @@ async fn finalize_sandbox(
       }
       Ok(())
     }
-    Ok(RunOutcome::Interrupted) => {
-      println!("{}", format!("Interrupted. Sandbox kept at: {}", sb.path.display()).yellow());
-      Ok(())
-    }
+    Ok(RunOutcome::Interrupted) => Ok(()),
     Err(e) => {
       let _ = std::fs::remove_dir_all(&sb.path);
       Err(e)
@@ -855,13 +850,27 @@ async fn run_sandbox_iterations(
   };
   match st {
     SandboxType::Docker => {
-      let container = sandbox::start_docker(sb).await?;
-      let ctx = ExecContext::Docker { container: &container, sandbox_path: &sb.path };
-      let result = run_loop(RunMode::Run, harness, iterations, &ctx).await;
+      let container = Arc::new(sandbox::start_docker(sb).await?);
+      let name = sb.original.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "sandbox".into());
+      let result = tui::run(
+        name,
+        harness,
+        RunMode::Run,
+        iterations,
+        sb.path.clone(),
+        Some(tui::TuiBackend::Docker(container.clone())),
+      )
+      .await;
       container.stop().await;
       outcome(result)
     }
-    SandboxType::Bwrap => outcome(sandbox::run_bwrap(sb, harness.as_str(), iterations).await),
+    SandboxType::Bwrap => {
+      let bwrap = Arc::new(sandbox::BwrapContext::new(sb)?);
+      let name = sb.original.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "sandbox".into());
+      outcome(
+        tui::run(name, harness, RunMode::Run, iterations, sb.path.clone(), Some(tui::TuiBackend::Bwrap(bwrap))).await,
+      )
+    }
   }
 }
 
@@ -895,10 +904,7 @@ async fn continue_sandbox(sandbox_path: &Path, iterations: u32) -> Result<(), Er
 
   match run_sandbox_iterations(&sb, mdata.harness, iterations, mdata.sandbox).await {
     Ok(RunOutcome::Completed) => Ok(()),
-    Ok(RunOutcome::Interrupted) => {
-      println!("{}", format!("Interrupted. Sandbox kept at: {}", sb.path.display()).yellow());
-      Ok(())
-    }
+    Ok(RunOutcome::Interrupted) => Ok(()),
     Err(e) => Err(e),
   }
 }

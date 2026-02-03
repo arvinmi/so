@@ -15,7 +15,10 @@ use ratatui::{
   widgets::{Clear, List, ListItem, Paragraph},
 };
 
-use crate::{Error, sandbox, tui::actions};
+use crate::{
+  Error, sandbox,
+  tui::{ConfirmChoice, actions, confirm_choice},
+};
 
 // =============================================================================
 // Colors
@@ -469,8 +472,8 @@ fn handle_popup_merge(
   sandbox_info: Option<(std::path::PathBuf, std::path::PathBuf)>,
 ) -> Result<(Option<MenuAction>, Option<Popup>), Error> {
   let mut replace = None;
-  match key {
-    KeyCode::Char('y') | KeyCode::Char('Y') => {
+  match confirm_choice(key) {
+    Some(ConfirmChoice::Yes) => {
       if let Some((sandbox_path, orig)) = sandbox_info {
         match actions::merge_sandbox(&sandbox_path, &orig) {
           Ok(()) => {
@@ -484,10 +487,10 @@ fn handle_popup_merge(
         }
       }
     }
-    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+    Some(ConfirmChoice::No) => {
       replace = Some(Popup::Detail);
     }
-    _ => {}
+    None => {}
   }
   Ok((None, replace))
 }
@@ -700,60 +703,15 @@ fn render_merge_popup(frame: &mut Frame, area: Rect, state: &MenuState) {
     Some(s) => s,
     None => return,
   };
-
-  // merge popup
-  let popup_area = centered_fixed(55, 7, area);
-  let width = popup_area.width as usize;
-
-  frame.render_widget(Clear, popup_area);
-
-  let mut lines: Vec<Line> = Vec::new();
-
-  lines.push(popup_header(" merge ", width, BORDER_GRAY));
-
-  lines.push(detail_empty(width));
-
-  // original path, with ~
-  let orig_str = sb.original.display().to_string();
-  let orig_str = if let Ok(home) = std::env::var("HOME") {
-    if orig_str.starts_with(&home) { orig_str.replacen(&home, "~", 1) } else { orig_str }
-  } else {
-    orig_str
-  };
-  let max_orig = width.saturating_sub(4);
-  let orig_display = if orig_str.chars().count() > max_orig {
-    format!("{}...", orig_str.chars().take(max_orig.saturating_sub(3)).collect::<String>())
-  } else {
-    orig_str
-  };
-  lines.push(detail_line(&format!(" {}", orig_display), width, YELLOW));
-
-  let branch = sandbox::git_branch(&sb.original).unwrap_or_else(|_| "main".into());
-  lines.push(detail_line(&format!(" {}", branch), width, DIM_GRAY));
-
-  let plus = format!("+{}", sb.insertions);
-  let minus = format!("-{}", sb.deletions);
-  let rest = format!(" ({} files)", sb.files_changed);
-  let stats_len = 1 + plus.chars().count() + 1 + minus.chars().count() + rest.chars().count();
-  let stats_pad = width.saturating_sub(stats_len + 2);
-  lines.push(Line::from(vec![
-    Span::styled("│", Style::default().fg(BORDER_GRAY)),
-    Span::styled(format!(" {}", plus), Style::default().fg(GREEN)),
-    Span::styled("/", Style::default().fg(TEXT_WHITE)),
-    Span::styled(minus, Style::default().fg(RED)),
-    Span::styled(rest, Style::default().fg(DIM_GRAY)),
-    Span::raw(" ".repeat(stats_pad)),
-    Span::styled("│", Style::default().fg(BORDER_GRAY)),
-  ]));
-
-  lines.push(detail_empty(width));
-
-  lines.push(popup_footer(" y yes │ n no ", width, BORDER_GRAY));
-
-  for (i, line) in lines.into_iter().enumerate() {
-    let line_area = Rect { x: popup_area.x, y: popup_area.y + i as u16, width: popup_area.width, height: 1 };
-    frame.render_widget(Paragraph::new(line), line_area);
-  }
+  super::popup::render_merge_popup(
+    frame,
+    area,
+    &sb.original,
+    sb.files_changed,
+    sb.insertions,
+    sb.deletions,
+    sb.commit_count,
+  );
 }
 
 fn render_clean_popup(frame: &mut Frame, area: Rect, projects: &[(String, usize)], selected: usize) {
@@ -964,16 +922,6 @@ fn detail_empty(width: usize) -> Line<'static> {
   let padding = width.saturating_sub(2);
   Line::from(vec![
     Span::styled("│", Style::default().fg(BORDER_GRAY)),
-    Span::raw(" ".repeat(padding)),
-    Span::styled("│", Style::default().fg(BORDER_GRAY)),
-  ])
-}
-
-fn detail_line(text: &str, width: usize, color: Color) -> Line<'static> {
-  let padding = width.saturating_sub(text.chars().count() + 2);
-  Line::from(vec![
-    Span::styled("│", Style::default().fg(BORDER_GRAY)),
-    Span::styled(text.to_string(), Style::default().fg(color)),
     Span::raw(" ".repeat(padding)),
     Span::styled("│", Style::default().fg(BORDER_GRAY)),
   ])

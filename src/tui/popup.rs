@@ -8,6 +8,8 @@ use ratatui::{
   widgets::{Clear, List, ListItem, Paragraph},
 };
 
+use crate::sandbox;
+
 const BORDER_GRAY: Color = Color::Rgb(70, 70, 70);
 const DIM_GRAY: Color = Color::Rgb(110, 110, 110);
 const TEXT_WHITE: Color = Color::Rgb(220, 220, 220);
@@ -175,6 +177,62 @@ pub fn render_continue_popup(frame: &mut Frame, area: Rect, input: &str) {
   lines.push(detail_empty(width));
 
   lines.push(popup_footer(" Enter start │ Esc back ", width, BORDER_GRAY));
+
+  render_lines(frame, popup_area, lines);
+}
+
+pub fn render_merge_popup(
+  frame: &mut Frame,
+  area: Rect,
+  orig: &Path,
+  files_changed: u32,
+  insertions: u32,
+  deletions: u32,
+  commit_count: u32,
+) {
+  let popup_area = centered_fixed(55, 7, area);
+  let width = popup_area.width as usize;
+
+  let mut lines: Vec<Line> = Vec::new();
+  lines.push(popup_header(" merge ", width, BORDER_GRAY));
+  lines.push(detail_empty(width));
+
+  let orig_str = orig.display().to_string();
+  let orig_str = if let Ok(home) = std::env::var("HOME") {
+    if orig_str.starts_with(&home) { orig_str.replacen(&home, "~", 1) } else { orig_str }
+  } else {
+    orig_str
+  };
+  let max_orig = width.saturating_sub(4);
+  let orig_display = if orig_str.chars().count() > max_orig {
+    format!("{}...", orig_str.chars().take(max_orig.saturating_sub(3)).collect::<String>())
+  } else {
+    orig_str
+  };
+  lines.push(popup_line(&format!(" {}", orig_display), width, YELLOW));
+
+  let branch = sandbox::git_branch(orig).unwrap_or_else(|_| "main".into());
+  lines.push(popup_line(&format!(" {}", branch), width, DIM_GRAY));
+
+  let plus = format!("+{}", insertions);
+  let minus = format!("-{}", deletions);
+  let files_word = if files_changed == 1 { "file" } else { "files" };
+  let commits_word = if commit_count == 1 { "commit" } else { "commits" };
+  let rest = format!(" ({} {})  {} {}", files_changed, files_word, commit_count, commits_word);
+  let stats_len = 1 + plus.chars().count() + 1 + minus.chars().count() + rest.chars().count();
+  let stats_pad = width.saturating_sub(stats_len + 2);
+  lines.push(Line::from(vec![
+    Span::styled("│", Style::default().fg(BORDER_GRAY)),
+    Span::styled(format!(" {}", plus), Style::default().fg(GREEN)),
+    Span::styled("/", Style::default().fg(TEXT_WHITE)),
+    Span::styled(minus, Style::default().fg(RED)),
+    Span::styled(rest, Style::default().fg(DIM_GRAY)),
+    Span::raw(" ".repeat(stats_pad)),
+    Span::styled("│", Style::default().fg(BORDER_GRAY)),
+  ]));
+
+  lines.push(detail_empty(width));
+  lines.push(popup_footer(" y yes │ n no ", width, BORDER_GRAY));
 
   render_lines(frame, popup_area, lines);
 }

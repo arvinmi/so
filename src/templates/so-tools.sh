@@ -20,9 +20,9 @@ run rm -rf /var/lib/apt/lists/*
 
 # install npm packages
 run npm i -g \
-  @anthropic-ai/claude-code@2.1.22 \
-  opencode-ai@1.1.39 \
-  @openai/codex@0.92.0 \
+  @anthropic-ai/claude-code@2.1.29 \
+  opencode-ai@1.1.49 \
+  @openai/codex@0.94.0 \
   jscpd
 
 echo "done"
