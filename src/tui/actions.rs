@@ -30,24 +30,17 @@ pub fn suspend_and_run_git(
   execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
   terminal.show_cursor().ok();
 
-  let mut cmd = std::process::Command::new("git");
-  if args.first().copied() == Some("diff")
-    && let Some(delta) = find_delta()
-  {
-    // force delta when available, regardless of pager env
-    let delta = delta.to_string_lossy();
-    cmd.arg("-c").arg(format!("core.pager={}", delta));
-    cmd.arg("-c").arg(format!("pager.diff={}", delta));
-    cmd.env_remove("GIT_PAGER");
-    cmd.env_remove("PAGER");
+  if args.first().copied() == Some("diff") {
+    let _ = run_diff_pager(args, cwd);
+  } else {
+    let _ = std::process::Command::new("git")
+      .args(args)
+      .current_dir(cwd)
+      .stdin(std::process::Stdio::inherit())
+      .stdout(std::process::Stdio::inherit())
+      .stderr(std::process::Stdio::inherit())
+      .status();
   }
-  let _ = cmd
-    .args(args)
-    .current_dir(cwd)
-    .stdin(std::process::Stdio::inherit())
-    .stdout(std::process::Stdio::inherit())
-    .stderr(std::process::Stdio::inherit())
-    .status();
 
   execute!(terminal.backend_mut(), EnterAlternateScreen).ok();
   if use_mouse_capture {
@@ -58,6 +51,57 @@ pub fn suspend_and_run_git(
   Ok(())
 }
 
+fn run_diff_pager(args: &[&str], cwd: &Path) -> Result<(), Error> {
+  let (cols, _) = crossterm::terminal::size().unwrap_or((0, 0));
+  let mut git = std::process::Command::new("git");
+  git.arg("-c").arg("color.ui=always");
+  git.args(args);
+  git.current_dir(cwd);
+  git.stdin(std::process::Stdio::inherit());
+  git.stdout(std::process::Stdio::piped());
+  git.stderr(std::process::Stdio::inherit());
+
+  let mut git_child = git.spawn()?;
+  let git_out = match git_child.stdout.take() {
+    Some(out) => out,
+    None => {
+      let _ = git_child.wait();
+      return Ok(());
+    }
+  };
+
+  let mut delta_child = None;
+  let pager_input: std::process::Stdio = if let Some(delta) = find_delta() {
+    let mut cmd = std::process::Command::new(delta);
+    cmd.arg("--paging=never");
+    if cols > 0 {
+      cmd.arg("--width").arg(cols.to_string());
+    }
+    let mut child =
+      cmd.stdin(git_out).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn()?;
+    let out = child.stdout.take().map(std::process::Stdio::from);
+    delta_child = Some(child);
+    out.unwrap_or_else(std::process::Stdio::null)
+  } else {
+    git_out.into()
+  };
+
+  let mut pager = std::process::Command::new("less");
+  pager.arg("-R");
+  pager.env("LESS", "SR");
+  pager.stdin(pager_input);
+  pager.stdout(std::process::Stdio::inherit());
+  pager.stderr(std::process::Stdio::inherit());
+  let mut pager_child = pager.spawn()?;
+
+  let _ = pager_child.wait();
+  if let Some(mut child) = delta_child {
+    let _ = child.wait();
+  }
+  let _ = git_child.wait();
+  Ok(())
+}
+
 pub fn suspend_and_run_shell(
   terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
   cwd: &Path,
@@ -65,6 +109,7 @@ pub fn suspend_and_run_shell(
 ) -> Result<(), Error> {
   // temporarily restore terminal to run interactive commands
   let _signals = SignalGuard::ignore();
+  let parent_pgrp = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
   disable_raw_mode().ok();
   execute!(terminal.backend_mut(), DisableMouseCapture).ok();
   execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
@@ -77,6 +122,13 @@ pub fn suspend_and_run_shell(
     .stdout(std::process::Stdio::inherit())
     .stderr(std::process::Stdio::inherit())
     .status();
+
+  // restore foreground process group before re-entering tui
+  if parent_pgrp > 0 {
+    unsafe {
+      libc::tcsetpgrp(libc::STDIN_FILENO, parent_pgrp);
+    }
+  }
 
   execute!(terminal.backend_mut(), EnterAlternateScreen).ok();
   if use_mouse_capture {
@@ -91,6 +143,8 @@ pub fn git_reset_hard(cwd: &Path, hash: &str) -> bool {
   std::process::Command::new("git")
     .args(["reset", "--hard", hash])
     .current_dir(cwd)
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
     .status()
     .map(|s| s.success())
     .unwrap_or(false)
@@ -103,20 +157,39 @@ pub fn merge_sandbox(sandbox_path: &Path, orig: &Path) -> Result<(), Error> {
     return Err(Error::UncommittedChanges);
   }
 
-  let fetch =
-    std::process::Command::new("git").arg("-C").arg(orig).args(["fetch"]).arg(sandbox_path).arg(&branch).status();
+  let fetch = std::process::Command::new("git")
+    .arg("-C")
+    .arg(orig)
+    .args(["fetch"])
+    .arg(sandbox_path)
+    .arg(&branch)
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status();
 
   if !fetch.map(|s| s.success()).unwrap_or(false) {
     return Err(Error::Other("fetch failed".into()));
   }
 
-  let merge = std::process::Command::new("git").arg("-C").arg(orig).args(["merge", "--squash", "FETCH_HEAD"]).status();
+  let merge = std::process::Command::new("git")
+    .arg("-C")
+    .arg(orig)
+    .args(["merge", "--squash", "FETCH_HEAD"])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status();
 
   if !merge.map(|s| s.success()).unwrap_or(false) {
     return Err(Error::Other("merge conflict".into()));
   }
 
-  let _ = std::process::Command::new("git").arg("-C").arg(orig).args(["checkout", "HEAD", "--", ".gitignore"]).status();
+  let _ = std::process::Command::new("git")
+    .arg("-C")
+    .arg(orig)
+    .args(["checkout", "HEAD", "--", ".gitignore"])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status();
 
   if sandbox_path.join("specs").exists() {
     let _ = sandbox::copy_dir(&sandbox_path.join("specs"), &orig.join("specs"));

@@ -8,6 +8,7 @@ use std::{
   io,
   path::{Path, PathBuf},
   process::Stdio,
+  sync::Arc,
   time::{Duration, Instant},
 };
 
@@ -25,7 +26,24 @@ use tokio::{
   sync::mpsc,
 };
 
-use crate::{Error, Harness, RunMode, build_prompt};
+use crate::{
+  Error, Harness, RunMode, build_prompt,
+  sandbox::{BwrapContext, DockerContainer},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfirmChoice {
+  Yes,
+  No,
+}
+
+pub(crate) fn confirm_choice(code: KeyCode) -> Option<ConfirmChoice> {
+  match code {
+    KeyCode::Char('y') | KeyCode::Char('Y') => Some(ConfirmChoice::Yes),
+    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => Some(ConfirmChoice::No),
+    _ => None,
+  }
+}
 
 const ACTIVITY_CAPACITY: usize = 1000;
 
@@ -51,6 +69,9 @@ pub enum RunPopup {
   },
   Continue {
     input: String,
+  },
+  MergeConfirm {
+    orig: PathBuf,
   },
   Error {
     message: String,
@@ -123,6 +144,7 @@ pub enum HarnessEvent {
   IterationComplete { n: u32, diff: Option<(u32, u32)>, msg: Option<String> },
   Activity { kind: ActivityKind, content: String },
   GitStats { files: u32, ins: u32, del: u32, commits: u32 },
+  Error { message: String },
   Finished,
 }
 
@@ -159,6 +181,9 @@ pub struct AppState {
   pub iter_visible: usize,
   pub should_quit: bool,
   pub interrupted: bool,
+  pub error_fatal: bool,
+  pub restart_harness: bool,
+  pub restart_from: Option<u32>,
   pub plan_tasks: Vec<String>,
   plan_raw: String,
 }
@@ -189,6 +214,9 @@ impl AppState {
       iter_visible: 5,
       should_quit: false,
       interrupted: false,
+      error_fatal: false,
+      restart_harness: false,
+      restart_from: None,
       plan_tasks: Vec::new(),
       plan_raw: String::new(),
     }
@@ -293,20 +321,27 @@ impl AppState {
 // Tui entry point
 // =============================================================================
 
+#[derive(Clone)]
+pub(crate) enum TuiBackend {
+  Bwrap(Arc<BwrapContext>),
+  Docker(Arc<DockerContainer>),
+}
+
 pub async fn run(
   sandbox_name: String,
   harness: Harness,
   mode: RunMode,
   max_iter: u32,
   cwd: PathBuf,
+  backend: Option<TuiBackend>,
 ) -> Result<(), Error> {
   enable_raw_mode().map_err(|e| Error::RawModeEnable(e.to_string()))?;
   let mut stdout = io::stdout();
   execute!(stdout, EnterAlternateScreen).map_err(|e| Error::AlternateScreenEnter(e.to_string()))?;
-  let backend = CrosstermBackend::new(stdout);
-  let mut terminal = Terminal::new(backend).map_err(|e| Error::TerminalCreate(e.to_string()))?;
+  let term_backend = CrosstermBackend::new(stdout);
+  let mut terminal = Terminal::new(term_backend).map_err(|e| Error::TerminalCreate(e.to_string()))?;
 
-  let result = run_loop(&mut terminal, sandbox_name, harness, mode, max_iter, cwd).await;
+  let result = run_loop(&mut terminal, sandbox_name, harness, mode, max_iter, cwd, backend).await;
 
   disable_raw_mode().ok();
   execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
@@ -322,13 +357,15 @@ async fn run_loop(
   mode: RunMode,
   max_iter: u32,
   cwd: PathBuf,
+  backend: Option<TuiBackend>,
 ) -> Result<(), Error> {
   let mut state = AppState::new(sandbox_name, cwd.clone(), harness.as_str().into(), max_iter);
   state.refresh_plan(&cwd);
   load_activity_log(&mut state, &cwd);
 
   let (harness_tx, mut harness_rx) = mpsc::unbounded_channel::<HarnessEvent>();
-  let harness_handle = tokio::spawn(run_harness_loop(harness, mode, max_iter, cwd.clone(), harness_tx));
+  let mut harness_handle =
+    tokio::spawn(run_harness_loop(harness, mode, 1, max_iter, cwd.clone(), harness_tx.clone(), backend.clone()));
 
   // use EventStream for reliable async event reading
   let mut event_stream = EventStream::new();
@@ -371,6 +408,25 @@ async fn run_loop(
       }
     }
 
+    if state.restart_harness {
+      if !harness_handle.is_finished() {
+        harness_handle.abort();
+      }
+      let start_iter = state.restart_from.take().unwrap_or(state.current_iter.saturating_add(1));
+      state.restart_harness = false;
+      state.status = RunStatus::Running;
+      state.end_time = None;
+      harness_handle = tokio::spawn(run_harness_loop(
+        harness,
+        mode,
+        start_iter,
+        state.max_iter,
+        cwd.clone(),
+        harness_tx.clone(),
+        backend.clone(),
+      ));
+    }
+
     if state.should_quit {
       break;
     }
@@ -393,6 +449,11 @@ fn handle_harness_event(state: &mut AppState, event: HarnessEvent) {
     }
     HarnessEvent::Activity { kind, content } => state.add_activity(kind, content),
     HarnessEvent::GitStats { files, ins, del, commits } => state.update_git_stats(files, ins, del, commits),
+    HarnessEvent::Error { message } => {
+      state.add_activity(ActivityKind::Text, format!("[error] {}", message));
+      state.popup = RunPopup::Error { message };
+      state.error_fatal = true;
+    }
     HarnessEvent::Finished => {
       state.status = RunStatus::Done;
       state.end_time = Some(Instant::now());
@@ -461,8 +522,14 @@ fn handle_term_event(
           }
           true
         }
+        RunPopup::MergeConfirm { orig } => {
+          if let Some(next) = handle_popup_merge(state, key, cwd, orig)? {
+            popup = next;
+          }
+          true
+        }
         RunPopup::Error { .. } => {
-          if let Some(next) = handle_popup_error(key) {
+          if let Some(next) = handle_popup_error(state, key) {
             popup = next;
           }
           true
@@ -497,7 +564,7 @@ fn handle_ctrl_c(state: &mut AppState, key: KeyEvent) -> bool {
 }
 
 fn handle_popup_options(
-  state: &mut AppState,
+  _state: &mut AppState,
   key: KeyEvent,
   terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
   cwd: &Path,
@@ -521,15 +588,7 @@ fn handle_popup_options(
     }
     KeyCode::Char('m') => {
       if let Some(orig) = actions::original_repo(cwd) {
-        match actions::merge_sandbox(cwd, &orig) {
-          Ok(()) => {
-            replace = Some(RunPopup::None);
-            state.should_quit = true;
-          }
-          Err(err) => {
-            replace = Some(RunPopup::Error { message: err.to_string() });
-          }
-        }
+        replace = Some(RunPopup::MergeConfirm { orig });
       } else {
         replace = Some(RunPopup::Error { message: Error::OriginalRepoNotFound.to_string() });
       }
@@ -571,6 +630,7 @@ fn handle_popup_reset(
           replace = Some(RunPopup::Error { message: "Reset failed".into() });
           return Ok(replace);
         }
+        refresh_iterations_from_commits(state, cwd);
         update_git_stats_state(state, cwd);
       }
       replace = Some(RunPopup::Options);
@@ -601,6 +661,8 @@ fn handle_popup_continue(state: &mut AppState, key: KeyEvent, input: &mut String
         state.iterations.push(Iteration::new(n));
       }
       state.status = RunStatus::Running;
+      state.restart_from = Some(state.current_iter.saturating_add(1));
+      state.restart_harness = true;
       replace = Some(RunPopup::None);
     }
     KeyCode::Esc => {
@@ -611,11 +673,37 @@ fn handle_popup_continue(state: &mut AppState, key: KeyEvent, input: &mut String
   Ok(replace)
 }
 
-fn handle_popup_error(key: KeyEvent) -> Option<RunPopup> {
+fn handle_popup_error(state: &mut AppState, key: KeyEvent) -> Option<RunPopup> {
   match key.code {
-    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => Some(RunPopup::Options),
+    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => {
+      if state.error_fatal {
+        state.should_quit = true;
+        return None;
+      }
+      Some(RunPopup::Options)
+    }
     _ => None,
   }
+}
+
+fn handle_popup_merge(state: &mut AppState, key: KeyEvent, cwd: &Path, orig: &Path) -> Result<Option<RunPopup>, Error> {
+  let mut replace = None;
+  match confirm_choice(key.code) {
+    Some(ConfirmChoice::Yes) => match actions::merge_sandbox(cwd, orig) {
+      Ok(()) => {
+        replace = Some(RunPopup::None);
+        state.should_quit = true;
+      }
+      Err(err) => {
+        replace = Some(RunPopup::Error { message: err.to_string() });
+      }
+    },
+    Some(ConfirmChoice::No) => {
+      replace = Some(RunPopup::Options);
+    }
+    None => {}
+  }
+  Ok(replace)
 }
 
 fn handle_nav_keys(state: &mut AppState, key: KeyEvent) {
@@ -645,9 +733,11 @@ fn handle_nav_keys(state: &mut AppState, key: KeyEvent) {
 async fn run_harness_loop(
   harness: Harness,
   mode: RunMode,
+  start_iter: u32,
   max_iter: u32,
   cwd: PathBuf,
   tx: mpsc::UnboundedSender<HarnessEvent>,
+  backend: Option<TuiBackend>,
 ) {
   let _ =
     tx.send(HarnessEvent::Activity { kind: ActivityKind::Text, content: format!("starting {}", harness.as_str()) });
@@ -658,12 +748,12 @@ async fn run_harness_loop(
     let _ = tx.send(HarnessEvent::Activity { kind: ActivityKind::Text, content: format!("tasks: {}", task_id) });
   }
 
-  for i in 1..=max_iter {
+  for i in start_iter..=max_iter {
     let _ = tx.send(HarnessEvent::IterationStart { n: i });
 
-    if let Err(e) = run_single_iteration(harness, mode, i, max_iter, &cwd, &tx).await {
-      let _ = tx.send(HarnessEvent::Activity { kind: ActivityKind::Text, content: format!("[error] {}", e) });
-      break;
+    if let Err(e) = run_single_iteration(harness, mode, i, max_iter, &cwd, &tx, backend.as_ref()).await {
+      let _ = tx.send(HarnessEvent::Error { message: e.to_string() });
+      return;
     }
 
     if check_status_done(&cwd) {
@@ -683,15 +773,16 @@ async fn run_single_iteration(
   max_iter: u32,
   cwd: &Path,
   tx: &mpsc::UnboundedSender<HarnessEvent>,
+  backend: Option<&TuiBackend>,
 ) -> Result<(), Error> {
   let prompt_path = cwd.join("specs/prompt.md");
   let base = std::fs::read_to_string(&prompt_path)?;
   let prompt = build_prompt(&base, mode, cwd, iter, max_iter);
 
   match harness {
-    Harness::Claude => run_claude(&prompt, cwd, tx, iter).await,
-    Harness::Opencode => run_opencode(&prompt, cwd, tx, iter).await,
-    Harness::Codex => run_codex(&prompt, cwd, tx, iter).await,
+    Harness::Claude => run_claude(&prompt, cwd, tx, iter, backend).await,
+    Harness::Opencode => run_opencode(&prompt, cwd, tx, iter, backend).await,
+    Harness::Codex => run_codex(&prompt, cwd, tx, iter, backend).await,
   }
 }
 
@@ -700,8 +791,9 @@ async fn run_claude(
   cwd: &Path,
   tx: &mpsc::UnboundedSender<HarnessEvent>,
   current_iter: u32,
+  backend: Option<&TuiBackend>,
 ) -> Result<(), Error> {
-  let mut cmd = Command::new("claude");
+  let mut cmd = harness_cmd(backend, cwd, "claude");
   if let Ok(m) = std::env::var("MODEL") {
     cmd.arg("--model").arg(m);
   }
@@ -732,11 +824,12 @@ async fn run_opencode(
   cwd: &Path,
   tx: &mpsc::UnboundedSender<HarnessEvent>,
   current_iter: u32,
+  backend: Option<&TuiBackend>,
 ) -> Result<(), Error> {
   let model = env_or_default("MODEL", "openai/gpt-5.2-codex");
   let effort = env_or_default("EFFORT", "medium");
 
-  let mut cmd = Command::new("opencode");
+  let mut cmd = harness_cmd(backend, cwd, "opencode");
   cmd.env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#);
   cmd.args(["run", "--log-level", "INFO", "-m", &model, "--variant", &effort, prompt]);
   cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -758,11 +851,12 @@ async fn run_codex(
   cwd: &Path,
   tx: &mpsc::UnboundedSender<HarnessEvent>,
   current_iter: u32,
+  backend: Option<&TuiBackend>,
 ) -> Result<(), Error> {
   let model = env_or_default("MODEL", "gpt-5.2-codex");
   let effort = env_or_default("EFFORT", "medium");
 
-  let mut cmd = Command::new("codex");
+  let mut cmd = harness_cmd(backend, cwd, "codex");
   let cfg = format!("model_reasoning_effort={}", effort);
   cmd.args(["exec", "--full-auto", prompt, "--model", &model, "--config", &cfg]);
   cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -815,6 +909,18 @@ fn update_git_stats(cwd: &Path, tx: &mpsc::UnboundedSender<HarnessEvent>) {
   }
 }
 
+fn harness_cmd(backend: Option<&TuiBackend>, cwd: &Path, program: &str) -> Command {
+  match backend {
+    Some(TuiBackend::Bwrap(ctx)) => ctx.cmd(program),
+    Some(TuiBackend::Docker(container)) => container.exec_cmd_tty(program, false),
+    None => {
+      let mut cmd = Command::new(program);
+      cmd.current_dir(cwd);
+      cmd
+    }
+  }
+}
+
 fn update_git_stats_state(state: &mut AppState, cwd: &Path) {
   if let Some((files, ins, del, commits)) = collect_git_stats(cwd) {
     state.files_changed = files;
@@ -822,6 +928,32 @@ fn update_git_stats_state(state: &mut AppState, cwd: &Path) {
     state.deletions = del;
     state.commit_count = commits;
   }
+}
+
+fn refresh_iterations_from_commits(state: &mut AppState, cwd: &Path) {
+  let mut commits = crate::sandbox::git_commits(cwd, crate::sandbox::BASE_TAG).unwrap_or_default();
+  commits.reverse();
+  let done = commits.len();
+
+  for (idx, iter) in state.iterations.iter_mut().enumerate() {
+    if idx < done {
+      iter.status = IterStatus::Completed;
+      iter.start_time = None;
+      iter.duration = None;
+      iter.diff_stats = None;
+      iter.commit_msg = commits.get(idx).map(|(_, msg)| msg.clone());
+    } else {
+      iter.status = IterStatus::Pending;
+      iter.start_time = None;
+      iter.duration = None;
+      iter.diff_stats = None;
+      iter.commit_msg = None;
+    }
+  }
+
+  state.current_iter = done as u32;
+  state.status = RunStatus::Done;
+  state.iter_scroll_offset = 0;
 }
 
 fn collect_git_stats(cwd: &Path) -> Option<(u32, u32, u32, u32)> {
