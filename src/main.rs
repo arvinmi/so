@@ -3,7 +3,7 @@ mod sandbox;
 use std::{
   cmp::min,
   collections::HashMap,
-  io::{self, Write},
+  io::{self, IsTerminal, Write},
   path::Path,
   process::Stdio,
   time::{Duration, Instant},
@@ -15,7 +15,7 @@ use clap::{
 };
 use colored::Colorize;
 use git2::Repository;
-use sandbox::{GpuStatus, SandboxType};
+use sandbox::{DockerContainer, GpuStatus, SandboxType};
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -139,6 +139,39 @@ enum RunMode {
   Run,
 }
 
+enum ExecContext<'a> {
+  Local { cwd: &'a Path },
+  Docker { container: &'a DockerContainer, sandbox_path: &'a Path },
+}
+
+impl<'a> ExecContext<'a> {
+  fn cmd(&self, program: &str) -> Command {
+    self.cmd_tty(program, false)
+  }
+
+  fn cmd_tty(&self, program: &str, tty: bool) -> Command {
+    match self {
+      Self::Local { cwd } => {
+        let mut c = Command::new(program);
+        c.current_dir(cwd);
+        c
+      }
+      Self::Docker { container, .. } => container.exec_cmd_tty(program, tty && std::io::stdin().is_terminal()),
+    }
+  }
+
+  fn sandbox_path(&self) -> &Path {
+    match self {
+      Self::Local { cwd } => cwd,
+      Self::Docker { sandbox_path, .. } => sandbox_path,
+    }
+  }
+}
+
+fn local_ctx<'a>(cwd: &'a Path) -> ExecContext<'a> {
+  ExecContext::Local { cwd }
+}
+
 // =============================================================================
 // Main
 // =============================================================================
@@ -239,7 +272,8 @@ async fn do_step(harness: Harness, iterations: u32) -> Result<(), Error> {
     std::fs::write(cwd.join("specs/status.md"), "Status: pending\n")?;
   }
 
-  run_loop(mode, harness, iterations, &cwd).await?;
+  let ctx = local_ctx(&cwd);
+  run_loop(mode, harness, iterations, &ctx).await?;
 
   if !unattended && let Some(base) = start_head {
     println!();
@@ -346,7 +380,8 @@ async fn do_plan(harness: Harness) -> Result<(), Error> {
 Never write code, only specs."#;
 
   println!("{}", format!("▶ Planning [{}]", harness.as_str()).cyan().bold());
-  run_harness(harness, prompt, RunMode::Step, TaskMode::Plan, &cwd).await
+  let ctx = local_ctx(&cwd);
+  run_harness(harness, prompt, RunMode::Step, TaskMode::Plan, &ctx).await
 }
 
 async fn do_learn(harness: Harness) -> Result<(), Error> {
@@ -375,7 +410,8 @@ When in doubt: explain more, code less.
 Start by asking what I want to learn."#;
 
   println!("{}", format!("▶ Learn [{}]", harness.as_str()).cyan().bold());
-  run_harness(harness, prompt, RunMode::Step, TaskMode::Learn, &cwd).await
+  let ctx = local_ctx(&cwd);
+  run_harness(harness, prompt, RunMode::Step, TaskMode::Learn, &ctx).await
 }
 
 async fn do_menu() -> Result<(), Error> {
@@ -530,7 +566,8 @@ async fn do_menu() -> Result<(), Error> {
 // Run loop
 // =============================================================================
 
-async fn run_loop(mode: RunMode, harness: Harness, max: u32, cwd: &Path) -> Result<(), Error> {
+async fn run_loop(mode: RunMode, harness: Harness, max: u32, ctx: &ExecContext<'_>) -> Result<(), Error> {
+  let cwd = ctx.sandbox_path();
   let prompt_path = cwd.join("specs/prompt.md");
   let status_path = cwd.join("specs/status.md");
   let unattended = std::env::var("SO_UNATTENDED").is_ok();
@@ -561,10 +598,10 @@ async fn run_loop(mode: RunMode, harness: Harness, max: u32, cwd: &Path) -> Resu
       format!("{}\n\nRecent commits:\n{}\n\n---\nIteration {}/{}.", base, commits, i, effective_max)
     };
 
-    run_harness(harness, &prompt, mode, TaskMode::Code, cwd).await?;
+    run_harness(harness, &prompt, mode, TaskMode::Code, ctx).await?;
 
     if unattended {
-      enforce_commit(harness, cwd).await;
+      enforce_commit(harness, ctx).await;
     }
 
     print_header_time(harness, i, effective_max, &fmt_time(iter_start.elapsed()));
@@ -598,108 +635,119 @@ fn task_count(cwd: &Path) -> Option<u32> {
 // Harness
 // =============================================================================
 
-async fn run_harness(harness: Harness, prompt: &str, mode: RunMode, task: TaskMode, cwd: &Path) -> Result<(), Error> {
+async fn run_harness(
+  harness: Harness,
+  prompt: &str,
+  mode: RunMode,
+  task: TaskMode,
+  ctx: &ExecContext<'_>,
+) -> Result<(), Error> {
   match harness {
-    Harness::Claude => run_claude(prompt, mode, cwd).await,
-    Harness::Opencode => run_opencode(prompt, mode, task, cwd).await,
-    Harness::Codex => run_codex(prompt, mode, task, cwd).await,
+    Harness::Claude => run_claude(prompt, mode, ctx).await,
+    Harness::Opencode => run_opencode(prompt, mode, task, ctx).await,
+    Harness::Codex => run_codex(prompt, mode, task, ctx).await,
   }
 }
 
-async fn run_claude(prompt: &str, mode: RunMode, cwd: &Path) -> Result<(), Error> {
-  let mut cmd = Command::new("claude");
+async fn run_claude(prompt: &str, mode: RunMode, ctx: &ExecContext<'_>) -> Result<(), Error> {
+  let mut cmd = ctx.cmd("claude");
   if let Ok(m) = std::env::var("MODEL") {
     cmd.arg("--model").arg(m);
   }
 
   if mode == RunMode::Step {
-    cmd.stdin(Stdio::piped()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).current_dir(cwd);
+    cmd.stdin(Stdio::piped()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
     let mut child = cmd.spawn().map_err(|e| harness_err("claude", e))?;
     if let Some(mut stdin) = child.stdin.take() {
       use tokio::io::AsyncWriteExt;
       stdin.write_all(prompt.as_bytes()).await?;
     }
-    check_status_code(child.wait().await?, "claude")
+    wait_child(child, "claude").await
   } else {
     cmd.args(["--dangerously-skip-permissions", "--setting-sources", "project,local"]);
     cmd.arg("--settings").arg(r#"{"outputStyle":"Explanatory","alwaysThinkingEnabled":true}"#);
     cmd.args(["-p", "--verbose", "--output-format", "stream-json"]).arg(prompt);
-    cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::inherit());
 
     // parse streaming JSON output
     let mut child = cmd.spawn().map_err(|e| harness_err("claude", e))?;
-    if let Some(stdout) = child.stdout.take() {
-      use tokio::io::{AsyncBufReadExt, BufReader};
-      let mut lines = BufReader::new(stdout).lines();
-      while let Some(line) = lines.next_line().await? {
-        if !line.starts_with('{') {
-          continue;
-        }
-        let j = match serde_json::from_str::<serde_json::Value>(&line) {
-          Ok(v) => v,
-          Err(_) => continue,
-        };
-        if j.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-          continue;
-        }
-        let content = match j.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
-          Some(c) => c,
-          None => continue,
-        };
-        for item in content {
-          if item.get("type").and_then(|t| t.as_str()) != Some("text") {
+    let reader = child.stdout.take().map(|stdout| {
+      tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+          if !line.starts_with('{') {
             continue;
           }
-          let text = match item.get("text").and_then(|t| t.as_str()) {
-            Some(t) => t,
+          let j = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+          };
+          if j.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+          }
+          let content = match j.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
+            Some(c) => c,
             None => continue,
           };
-          println!("{}\n", text);
+          for item in content {
+            if item.get("type").and_then(|t| t.as_str()) != Some("text") {
+              continue;
+            }
+            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+              println!("{}\n", text);
+            }
+          }
         }
-      }
+      })
+    });
+    let result = wait_child(child, "claude").await;
+    if let Some(reader) = reader {
+      let _ = reader.await;
     }
-    check_status_code(child.wait().await?, "claude")
+    result
   }
 }
 
-async fn run_opencode(prompt: &str, mode: RunMode, task: TaskMode, cwd: &Path) -> Result<(), Error> {
-  let (def_model, def_effort) = match task {
-    TaskMode::Plan => ("openai/gpt-5.2", "high"),
-    TaskMode::Learn => ("openai/gpt-5.2", "medium"),
-    TaskMode::Code => ("openai/gpt-5.2-codex", "medium"),
-  };
-  let model = std::env::var("MODEL").unwrap_or_else(|_| def_model.into());
-  let effort = std::env::var("EFFORT").unwrap_or_else(|_| def_effort.into());
+async fn run_opencode(prompt: &str, mode: RunMode, task: TaskMode, ctx: &ExecContext<'_>) -> Result<(), Error> {
+  let (model, effort) = resolve_model_effort(
+    task,
+    ("openai/gpt-5.2", "high"),
+    ("openai/gpt-5.2", "medium"),
+    ("openai/gpt-5.2-codex", "medium"),
+  );
 
-  let mut cmd = Command::new("opencode");
+  let mut cmd = ctx.cmd_tty("opencode", true);
   if mode == RunMode::Step {
     cmd.args(["--prompt", prompt, "-m", &model]);
   } else {
-    cmd.env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#);
+    // for local, set env here
+    // for docker, it's set in container startup
+    if matches!(ctx, ExecContext::Local { .. }) {
+      cmd.env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#);
+    }
     cmd.args(["run", "--log-level", "ERROR", "-m", &model, "--variant", &effort, prompt]);
   }
-  cmd.current_dir(cwd).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
-  check_status_code(cmd.status().await.map_err(|e| harness_err("opencode", e))?, "opencode")
+  cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+  let child = cmd.spawn().map_err(|e| harness_err("opencode", e))?;
+  wait_child(child, "opencode").await
 }
 
-async fn run_codex(prompt: &str, mode: RunMode, task: TaskMode, cwd: &Path) -> Result<(), Error> {
-  let (def_model, def_effort) = match task {
-    TaskMode::Plan => ("gpt-5.2", "high"),
-    TaskMode::Learn => ("gpt-5.2", "medium"),
-    TaskMode::Code => ("gpt-5.2-codex", "medium"),
-  };
-  let model = std::env::var("MODEL").unwrap_or_else(|_| def_model.into());
-  let effort = std::env::var("EFFORT").unwrap_or_else(|_| def_effort.into());
+async fn run_codex(prompt: &str, mode: RunMode, task: TaskMode, ctx: &ExecContext<'_>) -> Result<(), Error> {
+  let (model, effort) =
+    resolve_model_effort(task, ("gpt-5.2", "high"), ("gpt-5.2", "medium"), ("gpt-5.2-codex", "medium"));
 
-  let mut cmd = Command::new("codex");
+  let mut cmd = ctx.cmd("codex");
   let cfg = format!("model_reasoning_effort={}", effort);
+  let bypass = "--dangerously-bypass-approvals-and-sandbox";
   if mode == RunMode::Step {
-    cmd.args([prompt, "--model", &model, "--full-auto", "--config", &cfg]);
+    cmd.args([prompt, "--model", &model, bypass, "--config", &cfg]);
   } else {
-    cmd.args(["exec", "--full-auto", prompt, "--model", &model, "--config", &cfg]);
+    cmd.args(["exec", bypass, prompt, "--model", &model, "--config", &cfg]);
   }
-  cmd.current_dir(cwd).stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
-  check_status_code(cmd.status().await.map_err(|e| harness_err("codex", e))?, "codex")
+  cmd.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+  let child = cmd.spawn().map_err(|e| harness_err("codex", e))?;
+  wait_child(child, "codex").await
 }
 
 fn harness_err(name: &str, e: std::io::Error) -> Error {
@@ -711,21 +759,64 @@ fn harness_err(name: &str, e: std::io::Error) -> Error {
 }
 
 fn check_status_code(status: std::process::ExitStatus, name: &str) -> Result<(), Error> {
+  // use sigint (ctrl+c) and sigterm for graceful shutdown, not failure
+  #[cfg(unix)]
+  {
+    use std::os::unix::process::ExitStatusExt;
+    if status.signal().is_some_and(|sig| sig == libc::SIGINT || sig == libc::SIGTERM) {
+      return Ok(());
+    }
+    if status.code().is_some_and(|c| c == 130 || c == 143) {
+      return Ok(());
+    }
+  }
   if status.success() { Ok(()) } else { Err(Error::Harness(format!("`{}` failed", name))) }
+}
+
+// wait for child process, treating ctrl+c as normal exit
+async fn wait_child(mut child: tokio::process::Child, name: &str) -> Result<(), Error> {
+  use tokio::signal;
+  tokio::select! {
+    biased;
+    res = child.wait() => check_status_code(res.map_err(|e| harness_err(name, e))?, name),
+    _ = signal::ctrl_c() => {
+      println!();
+      let _ = child.kill().await;
+      let _ = child.wait().await;
+      Ok(())
+    }
+  }
+}
+
+fn resolve_model_effort(
+  task: TaskMode,
+  plan: (&'static str, &'static str),
+  learn: (&'static str, &'static str),
+  code: (&'static str, &'static str),
+) -> (String, String) {
+  let (def_model, def_effort) = match task {
+    TaskMode::Plan => plan,
+    TaskMode::Learn => learn,
+    TaskMode::Code => code,
+  };
+  let model = std::env::var("MODEL").unwrap_or_else(|_| def_model.into());
+  let effort = std::env::var("EFFORT").unwrap_or_else(|_| def_effort.into());
+  (model, effort)
 }
 
 // =============================================================================
 // Helpers
 // =============================================================================
 
-async fn enforce_commit(harness: Harness, cwd: &Path) {
+async fn enforce_commit(harness: Harness, ctx: &ExecContext<'_>) {
+  let cwd = ctx.sandbox_path();
   let msg = "Commit now. Message format:\n- What: <what was done>\n- Why: <reasoning>\n- Alternatives: <what else was considered>";
   for i in 1..=3 {
     if !sandbox::git_dirty(cwd).unwrap_or(false) {
       return;
     }
     eprintln!("\n{} uncommitted changes ({}/3)\n", "warning:".yellow().bold(), i);
-    if run_harness(harness, msg, RunMode::Run, TaskMode::Code, cwd).await.is_err() {
+    if run_harness(harness, msg, RunMode::Run, TaskMode::Code, ctx).await.is_err() {
       break;
     }
   }
@@ -838,10 +929,20 @@ async fn run_sandbox_iterations(
   iterations: u32,
   st: SandboxType,
 ) -> Result<RunOutcome, Error> {
-  match sandbox::run(sb, harness.as_str(), iterations, st).await {
+  let outcome = |result: Result<(), Error>| match result {
     Ok(()) => Ok(RunOutcome::Completed),
     Err(Error::Interrupted) => Ok(RunOutcome::Interrupted),
     Err(e) => Err(e),
+  };
+  match st {
+    SandboxType::Docker => {
+      let container = sandbox::start_docker(sb).await?;
+      let ctx = ExecContext::Docker { container: &container, sandbox_path: &sb.path };
+      let result = run_loop(RunMode::Run, harness, iterations, &ctx).await;
+      container.stop().await;
+      outcome(result)
+    }
+    SandboxType::Bwrap => outcome(sandbox::run_bwrap(sb, harness.as_str(), iterations).await),
   }
 }
 
