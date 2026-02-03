@@ -813,7 +813,7 @@ fn resolve_model_effort(
 
 async fn enforce_commit(harness: Harness, ctx: &ExecContext<'_>) {
   let cwd = ctx.sandbox_path();
-  let msg = "Commit now. Message format:\n- What: <what was done>\n- Why: <reasoning>\n- Alternatives: <what else was considered>";
+  let msg = "Commit now. Do not ask questions. Always commit no matter what.\nIf there are no changes, make an empty commit with --allow-empty.\nMessage format:\n- What: <what was done>\n- Why: <reasoning>\n- Alternatives: <what else was considered>";
   for i in 1..=3 {
     if !sandbox::git_dirty(cwd).unwrap_or(false) {
       return;
