@@ -9,17 +9,10 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use super::{ActivityKind, AppState, FocusPane, IterStatus, RunPopup, RunStatus};
-
-// set colors
-const BORDER_GRAY: Color = Color::Rgb(70, 70, 70);
-const DIM_GRAY: Color = Color::Rgb(110, 110, 110);
-const MEDIUM_GRAY: Color = Color::Rgb(160, 160, 160);
-const TEXT_WHITE: Color = Color::Rgb(220, 220, 220);
-const GREEN: Color = Color::Rgb(80, 200, 120);
-const YELLOW: Color = Color::Rgb(220, 180, 50);
-const RED: Color = Color::Rgb(220, 80, 80);
-const CYAN: Color = Color::Rgb(80, 180, 200);
+use super::{
+  ActivityKind, AppState, BORDER_GRAY, CYAN, DIM_GRAY, FocusPane, GREEN, IterStatus, MEDIUM_GRAY, RED, RunPopup,
+  RunStatus, TEXT_WHITE, YELLOW,
+};
 
 pub fn render(frame: &mut Frame, state: &mut AppState) {
   let area = frame.area();
@@ -98,7 +91,7 @@ fn render_header_box(frame: &mut Frame, area: Rect, state: &AppState, width: usi
     RunStatus::Done => ("■", "DONE", RED),
   };
 
-  let status_text = format!("{} {}", icon, label);
+  let status_text = format!("{icon} {label}");
   let text_len = status_text.chars().count();
   let inner_width = width.saturating_sub(2);
   let left_pad = inner_width.saturating_sub(text_len) / 2;
@@ -126,10 +119,12 @@ fn render_iterations_section(frame: &mut Frame, area: Rect, state: &AppState) {
   let [header_area, content_area, footer_area] =
     Layout::vertical([Constraint::Length(1), Constraint::Fill(1), Constraint::Length(1)]).areas(area);
 
-  // header: ┌ iterations: 1/1 │ +0/-0 (0 files) │ commits: 0 ───────────┐
+  // header: ┌ iterations: 1/2 │ tasks: 1 working, 1 done │ +0/-0 (0 files) ─┐
+  let working = state.iterations.iter().filter(|i| i.status == IterStatus::Running).count();
+  let done = state.iterations.iter().filter(|i| i.status == IterStatus::Completed).count();
   let label = format!(
-    " iterations: {}/{} │ +{}/-{} ({} files) │ commits: {} ",
-    state.current_iter, state.max_iter, state.insertions, state.deletions, state.files_changed, state.commit_count
+    " iterations: {}/{} │ tasks: {} working, {} done │ +{}/-{} ({} files) ",
+    state.current_iter, state.max_iter, working, done, state.insertions, state.deletions, state.files_changed
   );
 
   frame.render_widget(Paragraph::new(box_header(&label, width, header_color)), header_area);
@@ -146,7 +141,10 @@ fn render_iterations_section(frame: &mut Frame, area: Rect, state: &AppState) {
       let (icon, icon_color) = match iter.status {
         IterStatus::Pending => ("○", DIM_GRAY),
         IterStatus::Running => ("◐", YELLOW),
-        IterStatus::Completed => ("●", GREEN),
+        IterStatus::Completed => {
+          // green if committed, red if not
+          if iter.commit_msg.is_some() { ("●", GREEN) } else { ("●", RED) }
+        }
       };
 
       // get task from plan_tasks, fall back to status desc
@@ -156,7 +154,7 @@ fn render_iterations_section(frame: &mut Frame, area: Rect, state: &AppState) {
         IterStatus::Completed => iter.commit_msg.clone().unwrap_or_else(|| "completed".into()),
       });
 
-      let duration = iter.elapsed().map(|d| format!("[{}]", fmt_duration_short(d))).unwrap_or_else(|| "[--:--]".into());
+      let duration = iter.elapsed().map_or_else(|| "[--:--]".into(), |d| format!("[{}]", fmt_duration_short(d)));
 
       // ● 1   Task from implementation plan [00:45]
       // leave room for icon, num, duration, borders
@@ -170,7 +168,7 @@ fn render_iterations_section(frame: &mut Frame, area: Rect, state: &AppState) {
 
       let line = Line::from(vec![
         Span::styled("│", Style::default().fg(BORDER_GRAY)),
-        Span::styled(format!(" {} ", icon), Style::default().fg(icon_color)),
+        Span::styled(format!(" {icon} "), Style::default().fg(icon_color)),
         Span::styled(format!("{:<2}  ", iter.number), Style::default().fg(TEXT_WHITE)),
         Span::styled(task_display, Style::default().fg(TEXT_WHITE)),
         Span::raw(" "),
@@ -222,7 +220,7 @@ fn render_activity_section(frame: &mut Frame, area: Rect, state: &AppState) {
       let elapsed = entry.timestamp.saturating_duration_since(state.start_time);
       let mins = elapsed.as_secs() / 60;
       let secs = elapsed.as_secs() % 60;
-      let time_str = format!("{:>2} {:02}", mins, secs);
+      let time_str = format!("{mins:>2} {secs:02}");
 
       let (prefix, is_tool) = match entry.kind {
         ActivityKind::Reading => ("reading ", true),
@@ -232,13 +230,13 @@ fn render_activity_section(frame: &mut Frame, area: Rect, state: &AppState) {
       };
 
       // fixed parts: │ + time (8) + harness (9) + │ = 19 chars
-      let time_part = format!(" {}  ", time_str);
-      let harness_part = format!("{:<8} ", harness);
+      let time_part = format!(" {time_str}  ");
+      let harness_part = format!("{harness:<8} ");
       let content = format!("{}{}", prefix, entry.content);
       let max_content = width.saturating_sub(20);
       let display = truncate_str(&content, max_content);
       let padding = width.saturating_sub(19 + display.width());
-      let text_color = if is_tool { DIM_GRAY } else { TEXT_WHITE };
+      let text_color = if is_tool { TEXT_WHITE } else { DIM_GRAY };
 
       let line = Line::from(vec![
         Span::styled("│", Style::default().fg(BORDER_GRAY)),
@@ -342,7 +340,7 @@ fn truncate_str(s: &str, max_width: usize) -> String {
       result.push(c);
       width += cw;
     }
-    format!("{}...", result)
+    format!("{result}...")
   }
 }
 
@@ -351,14 +349,14 @@ fn fmt_duration(d: Duration) -> String {
   let hours = secs / 3600;
   let mins = (secs % 3600) / 60;
   let s = secs % 60;
-  format!("{:02}:{:02}:{:02}", hours, mins, s)
+  format!("{hours:02}:{mins:02}:{s:02}")
 }
 
 fn fmt_duration_short(d: Duration) -> String {
   let secs = d.as_secs();
   let mins = secs / 60;
   let s = secs % 60;
-  format!("{:02}:{:02}", mins, s)
+  format!("{mins:02}:{s:02}")
 }
 
 fn render_options_popup(frame: &mut Frame, area: Rect, state: &AppState) {

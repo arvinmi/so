@@ -17,20 +17,11 @@ use ratatui::{
 
 use crate::{
   Error, sandbox,
-  tui::{ConfirmChoice, actions, confirm_choice},
+  tui::{
+    BORDER_GRAY, ConfirmChoice, DIM_GRAY, GREEN, MAGENTA, RED, TEXT_WHITE, YELLOW, actions, confirm_choice,
+    popup::{centered_fixed, detail_empty, error_empty, popup_footer, popup_header},
+  },
 };
-
-// =============================================================================
-// Colors
-// =============================================================================
-
-const BORDER_GRAY: Color = Color::Rgb(70, 70, 70);
-const DIM_GRAY: Color = Color::Rgb(110, 110, 110);
-const TEXT_WHITE: Color = Color::Rgb(220, 220, 220);
-const GREEN: Color = Color::Rgb(80, 200, 120);
-const YELLOW: Color = Color::Rgb(220, 180, 50);
-const RED: Color = Color::Rgb(220, 80, 80);
-const MAGENTA: Color = Color::Rgb(180, 100, 180);
 
 // =============================================================================
 // State
@@ -258,7 +249,6 @@ async fn run_loop(
             return Ok(action);
           }
         }
-        Ok(Event::Resize(_, _)) => {}
         _ => {}
       }
     }
@@ -518,7 +508,7 @@ fn handle_popup_clean(
         replace = Some(Popup::ConfirmClean { project: Some(project.clone()), count: *count });
       }
     }
-    KeyCode::Char('a') | KeyCode::Char('A') => {
+    KeyCode::Char('a' | 'A') => {
       let total: usize = projects.iter().map(|(_, c)| c).sum();
       replace = Some(Popup::ConfirmClean { project: None, count: total });
     }
@@ -537,7 +527,7 @@ fn handle_popup_confirm_clean(
 ) -> Result<(Option<MenuAction>, Option<Popup>), Error> {
   let mut replace = None;
   match key {
-    KeyCode::Char('y') | KeyCode::Char('Y') => {
+    KeyCode::Char('y' | 'Y') => {
       match project {
         Some(proj) => {
           for sb in &state.sandboxes {
@@ -556,8 +546,9 @@ fn handle_popup_confirm_clean(
       if let Some(action) = refresh_sandboxes_after_delete(state) {
         return Ok((Some(action), Some(Popup::None)));
       }
+      replace = Some(Popup::None);
     }
-    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+    KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => {
       let projects = state.project_summaries();
       replace = Some(Popup::Clean { projects, selected: 0 });
     }
@@ -573,13 +564,14 @@ fn handle_popup_confirm_delete(
 ) -> Result<(Option<MenuAction>, Option<Popup>), Error> {
   let mut replace = None;
   match key {
-    KeyCode::Char('y') | KeyCode::Char('Y') => {
+    KeyCode::Char('y' | 'Y') => {
       let _ = std::fs::remove_dir_all(path);
       if let Some(action) = refresh_sandboxes_after_delete(state) {
         return Ok((Some(action), Some(Popup::None)));
       }
+      replace = Some(Popup::None);
     }
-    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+    KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => {
       replace = Some(Popup::None);
     }
     _ => {}
@@ -651,7 +643,7 @@ fn render_list(frame: &mut Frame, area: Rect, state: &mut MenuState, width: usiz
   // footer
   let count = state.sandbox_count();
   let keys = if state.input_buffer.is_empty() {
-    format!(" [1-{}] select │ x delete │ c clean │ ^C quit ", count)
+    format!(" [1-{count}] select │ x delete │ c clean │ ^C quit ")
   } else {
     format!(" [{}] │ Enter select │ Esc back ", state.input_buffer)
   };
@@ -681,10 +673,7 @@ fn render_popup(frame: &mut Frame, area: Rect, state: &MenuState) {
 }
 
 fn render_detail_popup(frame: &mut Frame, area: Rect, state: &MenuState) {
-  let sb = match state.selected_sandbox() {
-    Some(s) => s,
-    None => return,
-  };
+  let Some(sb) = state.selected_sandbox() else { return };
 
   let time_str = fmt_age(sb.created.elapsed().map(|d| d.as_secs() / 60).unwrap_or(0));
   let data = super::popup::DetailPopupData {
@@ -699,10 +688,7 @@ fn render_detail_popup(frame: &mut Frame, area: Rect, state: &MenuState) {
 }
 
 fn render_merge_popup(frame: &mut Frame, area: Rect, state: &MenuState) {
-  let sb = match state.selected_sandbox() {
-    Some(s) => s,
-    None => return,
-  };
+  let Some(sb) = state.selected_sandbox() else { return };
   super::popup::render_merge_popup(
     frame,
     area,
@@ -731,7 +717,7 @@ fn render_clean_popup(frame: &mut Frame, area: Rect, projects: &[(String, usize)
   for (idx, (name, count)) in projects.iter().enumerate() {
     let bg = if idx == selected { Color::Rgb(40, 40, 50) } else { Color::Reset };
     let count_word = if *count == 1 { "sandbox" } else { "sandboxes" };
-    let info = format!("({} {})", count, count_word);
+    let info = format!("({count} {count_word})");
     let name_display = if name.chars().count() > 20 {
       format!("{}...", name.chars().take(17).collect::<String>())
     } else {
@@ -742,7 +728,7 @@ fn render_clean_popup(frame: &mut Frame, area: Rect, projects: &[(String, usize)
 
     lines.push(Line::from(vec![
       Span::styled("│", Style::default().fg(BORDER_GRAY)),
-      Span::styled(format!(" {}", name_display), Style::default().fg(TEXT_WHITE).bg(bg)),
+      Span::styled(format!(" {name_display}"), Style::default().fg(TEXT_WHITE).bg(bg)),
       Span::styled("  ", Style::default().bg(bg)),
       Span::styled(info, Style::default().fg(DIM_GRAY).bg(bg)),
       Span::styled(" ".repeat(padding), Style::default().bg(bg)),
@@ -777,7 +763,7 @@ fn render_confirm_popup(frame: &mut Frame, area: Rect, project: Option<&str>, co
   lines.push(error_empty(width));
 
   let sandbox_word = if count == 1 { "sandbox" } else { "sandboxes" };
-  let count_part = format!(" ({} {})", count, sandbox_word);
+  let count_part = format!(" ({count} {sandbox_word})");
   let (name_part, name_len) = match project {
     Some(p) => (p.to_string(), p.chars().count()),
     None => ("all".to_string(), 3),
@@ -845,15 +831,6 @@ fn render_confirm_delete_popup(frame: &mut Frame, area: Rect, name: &str) {
 // Helpers
 // =============================================================================
 
-fn centered_fixed(percent_x: u16, height: u16, r: Rect) -> Rect {
-  // fixed height, percent width, centered
-  let top_pad = r.height.saturating_sub(height) / 2;
-  let popup_width = (r.width as u32 * percent_x as u32 / 100) as u16;
-  let left_pad = r.width.saturating_sub(popup_width) / 2;
-
-  Rect { x: r.x + left_pad, y: r.y + top_pad, width: popup_width.min(r.width), height: height.min(r.height) }
-}
-
 fn empty_line(width: usize) -> ListItem<'static> {
   let padding = width.saturating_sub(2);
   ListItem::new(Line::from(vec![
@@ -864,7 +841,7 @@ fn empty_line(width: usize) -> ListItem<'static> {
 }
 
 fn project_line(name: &str, width: usize) -> ListItem<'static> {
-  let inner = format!("  {} ", name);
+  let inner = format!("  {name} ");
   let padding = width.saturating_sub(inner.chars().count() + 2);
   ListItem::new(Line::from(vec![
     Span::styled("│", Style::default().fg(BORDER_GRAY)),
@@ -887,11 +864,11 @@ fn sandbox_line(sb: &sandbox::Info, width: usize, flat_idx: usize, selected: boo
 
   // fixed-width columns: indent, num, name, status, age
   let name_width = width.saturating_sub(34).max(20);
-  let num_part = format!("{:>2}.", flat_idx);
+  let num_part = format!("{flat_idx:>2}.");
 
   let name_display = if sb.name.chars().count() > name_width {
     let truncated: String = sb.name.chars().take(name_width.saturating_sub(3)).collect();
-    format!("{}...", truncated)
+    format!("{truncated}...")
   } else {
     format!("{:<width$}", sb.name, width = name_width)
   };
@@ -908,7 +885,7 @@ fn sandbox_line(sb: &sandbox::Info, width: usize, flat_idx: usize, selected: boo
   ListItem::new(Line::from(vec![
     Span::styled("│", Style::default().fg(BORDER_GRAY)),
     Span::styled("    ", Style::default().bg(bg)),
-    Span::styled(format!("{}   ", num_part), num_style),
+    Span::styled(format!("{num_part}   "), num_style),
     Span::styled(name_display, name_style),
     Span::styled("  ", Style::default().bg(bg)),
     Span::styled(format!("{:<10}", sb.status), status_style),
@@ -916,24 +893,6 @@ fn sandbox_line(sb: &sandbox::Info, width: usize, flat_idx: usize, selected: boo
     Span::styled(" ".repeat(padding), Style::default().bg(bg)),
     Span::styled("│", Style::default().fg(BORDER_GRAY)),
   ]))
-}
-
-fn detail_empty(width: usize) -> Line<'static> {
-  let padding = width.saturating_sub(2);
-  Line::from(vec![
-    Span::styled("│", Style::default().fg(BORDER_GRAY)),
-    Span::raw(" ".repeat(padding)),
-    Span::styled("│", Style::default().fg(BORDER_GRAY)),
-  ])
-}
-
-fn error_empty(width: usize) -> Line<'static> {
-  let padding = width.saturating_sub(2);
-  Line::from(vec![
-    Span::styled("│", Style::default().fg(RED)),
-    Span::raw(" ".repeat(padding)),
-    Span::styled("│", Style::default().fg(RED)),
-  ])
 }
 
 fn build_flat(projects: &[(String, Vec<usize>)]) -> Vec<FlatItem> {
@@ -947,32 +906,11 @@ fn build_flat(projects: &[(String, Vec<usize>)]) -> Vec<FlatItem> {
   items
 }
 
-fn popup_header(label: &str, width: usize, border_color: Color) -> Line<'static> {
-  let dashes = width.saturating_sub(label.chars().count() + 2);
-  Line::from(vec![
-    Span::styled("┌", Style::default().fg(border_color)),
-    Span::styled(label.to_string(), Style::default().fg(TEXT_WHITE)),
-    Span::styled("─".repeat(dashes), Style::default().fg(border_color)),
-    Span::styled("┐", Style::default().fg(border_color)),
-  ])
-}
-
-fn popup_footer(keys: &str, width: usize, border_color: Color) -> Line<'static> {
-  let dashes = width.saturating_sub(keys.chars().count() + 2);
-  Line::from(vec![
-    Span::styled("└", Style::default().fg(border_color)),
-    Span::styled(keys.to_string(), Style::default().fg(DIM_GRAY)),
-    Span::styled("─".repeat(dashes), Style::default().fg(border_color)),
-    Span::styled("┘", Style::default().fg(border_color)),
-  ])
-}
-
 fn project_name_from(name: &str) -> String {
   name
     .strip_prefix("sandbox-")
     .and_then(|s| s.rsplit_once('-'))
-    .map(|(p, _)| p.to_string())
-    .unwrap_or_else(|| name.to_string())
+    .map_or_else(|| name.to_string(), |(p, _)| p.to_string())
 }
 
 fn refresh_sandboxes_after_delete(state: &mut MenuState) -> Option<MenuAction> {
@@ -987,7 +925,7 @@ fn refresh_sandboxes_after_delete(state: &mut MenuState) -> Option<MenuAction> {
 
 fn fmt_age(mins: u64) -> String {
   if mins < 60 {
-    format!("{}m", mins)
+    format!("{mins}m")
   } else if mins < 1440 {
     format!("{}h", mins / 60)
   } else {
