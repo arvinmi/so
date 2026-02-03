@@ -912,11 +912,11 @@ async fn run_codex(
     "exec",
     "--full-auto",
     "--dangerously-bypass-approvals-and-sandbox",
-    prompt,
     "--model",
     &model,
     "--config",
     &cfg,
+    prompt,
   ]);
   cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
