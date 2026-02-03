@@ -613,7 +613,25 @@ fn check_dir(a: &mut Vec<OsString>, created: &mut HashSet<PathBuf>, path: &Path)
 // Credentials
 // =============================================================================
 
+fn cleanup_stale_creds() {
+  let Ok(entries) = std::fs::read_dir("/tmp") else { return };
+  for entry in entries.flatten() {
+    let name = entry.file_name();
+    let Some(name_str) = name.to_str() else { continue };
+    let Some(pid_str) = name_str.strip_prefix("so-creds-") else { continue };
+    let Ok(pid) = pid_str.parse::<i32>() else { continue };
+
+    // check if process is still running
+    let running = unsafe { libc::kill(pid, 0) == 0 };
+    if !running {
+      let _ = std::fs::remove_dir_all(entry.path());
+    }
+  }
+}
+
 fn setup_creds() -> Result<PathBuf, Error> {
+  cleanup_stale_creds();
+
   let home = dirs::home_dir().ok_or(Error::NoHome)?;
   let creds = PathBuf::from(format!("/tmp/so-creds-{}", std::process::id()));
   std::fs::create_dir_all(&creds)?;
@@ -638,9 +656,11 @@ fn setup_creds() -> Result<PathBuf, Error> {
 "#,
   )?;
 
-  // copy configs excluding global agent files
-  copy_filtered(&home.join(".claude"), &creds.join(".claude"), &["CLAUDE.md"])?;
-  copy_filtered(&home.join(".codex"), &creds.join(".codex"), &["AGENTS.md"])?;
+  // copy configs excluding global agent files and bulky dirs
+  let claude_exclude = &["CLAUDE.md", "file-history", "debug", "todos"];
+  let codex_exclude = &["AGENTS.md", "sessions", "log", "tmp", "shell_snapshots"];
+  copy_filtered(&home.join(".claude"), &creds.join(".claude"), claude_exclude)?;
+  copy_filtered(&home.join(".codex"), &creds.join(".codex"), codex_exclude)?;
   copy_filtered(&home.join(".config/opencode"), &creds.join(".config/opencode"), &["opencode.json"])?;
   copy_filtered(&home.join(".local/share/opencode"), &creds.join(".local/share/opencode"), &[])?;
   if home.join(".claude.json").exists() {
