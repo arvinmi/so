@@ -197,7 +197,6 @@ pub struct AppState {
   pub iter_visible: usize,
   pub should_quit: bool,
   pub interrupted: bool,
-  pub error_fatal: bool,
   pub restart_harness: bool,
   pub restart_from: Option<u32>,
   pub plan_tasks: Vec<String>,
@@ -230,7 +229,6 @@ impl AppState {
       iter_visible: 5,
       should_quit: false,
       interrupted: false,
-      error_fatal: false,
       restart_harness: false,
       restart_from: None,
       plan_tasks: Vec::new(),
@@ -465,7 +463,6 @@ fn handle_harness_event(state: &mut AppState, event: HarnessEvent) {
     HarnessEvent::Error { message } => {
       state.add_activity(ActivityKind::Text, format!("[error] {message}"));
       state.popup = RunPopup::Error { message };
-      state.error_fatal = true;
     }
     HarnessEvent::Finished => {
       state.status = RunStatus::Done;
@@ -677,15 +674,9 @@ fn handle_popup_continue(state: &mut AppState, key: KeyEvent, input: &mut String
   Ok(replace)
 }
 
-fn handle_popup_error(state: &mut AppState, key: KeyEvent) -> Option<RunPopup> {
+fn handle_popup_error(_state: &mut AppState, key: KeyEvent) -> Option<RunPopup> {
   match key.code {
-    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => {
-      if state.error_fatal {
-        state.should_quit = true;
-        return None;
-      }
-      Some(RunPopup::Options)
-    }
+    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => Some(RunPopup::None),
     _ => None,
   }
 }
