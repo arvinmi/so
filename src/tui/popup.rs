@@ -92,7 +92,7 @@ pub fn render_error_popup(frame: &mut Frame, area: Rect, message: &str) {
   lines.push(error_empty(width));
   lines.push(error_empty(width));
 
-  lines.push(popup_footer(" Enter ", width, RED));
+  lines.push(popup_footer(" Enter ok", width, RED));
 
   render_lines(frame, popup_area, lines);
 }

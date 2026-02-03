@@ -229,13 +229,14 @@ fn render_activity_section(frame: &mut Frame, area: Rect, state: &AppState) {
         ActivityKind::Thinking | ActivityKind::Text | ActivityKind::Code => ("", false),
       };
 
-      // fixed parts: │ + time (8) + harness (9) + │ = 19 chars
+      // fixed parts: │ (1) + time (8) + harness (9) + │ (1) = 19 chars
       let time_part = format!(" {time_str}  ");
       let harness_part = format!("{harness:<8} ");
       let content = format!("{}{}", prefix, entry.content);
-      let max_content = width.saturating_sub(20);
+      let fixed_width = 19;
+      let max_content = width.saturating_sub(fixed_width);
       let display = truncate_str(&content, max_content);
-      let padding = width.saturating_sub(19 + display.width());
+      let padding = width.saturating_sub(fixed_width + display.width());
       let text_color = if is_tool { TEXT_WHITE } else { DIM_GRAY };
 
       let line = Line::from(vec![
