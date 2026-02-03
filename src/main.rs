@@ -91,6 +91,8 @@ pub enum Error {
   OriginalRepoNotFound,
   #[error("sandbox metadata missing, start a new run")]
   SandboxMetadataMissing,
+  #[error("no active sandboxes. Run `so run` to start a new sandbox")]
+  NoActiveSandboxes,
   #[error("menu requires a terminal")]
   MenuRequiresTerminal,
   #[error("failed to enable raw mode: {0}")]

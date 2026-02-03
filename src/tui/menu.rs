@@ -203,8 +203,7 @@ enum FlatItem {
 pub async fn run() -> Result<MenuAction, Error> {
   let sandboxes = sandbox::list()?;
   if sandboxes.is_empty() {
-    eprintln!("error: no active sandboxes\n\n  run `so run` to start a new sandbox");
-    return Ok(MenuAction::Quit);
+    return Err(Error::NoActiveSandboxes);
   }
 
   if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
