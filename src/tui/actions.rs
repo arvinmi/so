@@ -14,7 +14,7 @@ use crate::{Error, sandbox};
 
 pub fn diff_range(cwd: &Path) -> String {
   let base = sandbox::git_base(cwd, sandbox::BASE_TAG);
-  format!("{}..HEAD", base)
+  format!("{base}..HEAD")
 }
 
 pub fn suspend_and_run_git(
@@ -25,10 +25,7 @@ pub fn suspend_and_run_git(
 ) -> Result<(), Error> {
   // temporarily restore terminal to run interactive commands
   let _signals = SignalGuard::ignore();
-  disable_raw_mode().ok();
-  execute!(terminal.backend_mut(), DisableMouseCapture).ok();
-  execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
-  terminal.show_cursor().ok();
+  suspend_terminal(terminal);
 
   if args.first().copied() == Some("diff") {
     let _ = run_diff_pager(args, cwd);
@@ -42,12 +39,7 @@ pub fn suspend_and_run_git(
       .status();
   }
 
-  execute!(terminal.backend_mut(), EnterAlternateScreen).ok();
-  if use_mouse_capture {
-    execute!(terminal.backend_mut(), EnableMouseCapture).ok();
-  }
-  enable_raw_mode().ok();
-  terminal.clear().ok();
+  resume_terminal(terminal, use_mouse_capture);
   Ok(())
 }
 
@@ -62,12 +54,9 @@ fn run_diff_pager(args: &[&str], cwd: &Path) -> Result<(), Error> {
   git.stderr(std::process::Stdio::inherit());
 
   let mut git_child = git.spawn()?;
-  let git_out = match git_child.stdout.take() {
-    Some(out) => out,
-    None => {
-      let _ = git_child.wait();
-      return Ok(());
-    }
+  let Some(git_out) = git_child.stdout.take() else {
+    let _ = git_child.wait();
+    return Ok(());
   };
 
   let mut delta_child = None;
@@ -110,10 +99,7 @@ pub fn suspend_and_run_shell(
   // temporarily restore terminal to run interactive commands
   let _signals = SignalGuard::ignore();
   let parent_pgrp = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
-  disable_raw_mode().ok();
-  execute!(terminal.backend_mut(), DisableMouseCapture).ok();
-  execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
-  terminal.show_cursor().ok();
+  suspend_terminal(terminal);
 
   let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
   let _ = std::process::Command::new(&shell)
@@ -130,13 +116,24 @@ pub fn suspend_and_run_shell(
     }
   }
 
+  resume_terminal(terminal, use_mouse_capture);
+  Ok(())
+}
+
+fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
+  disable_raw_mode().ok();
+  execute!(terminal.backend_mut(), DisableMouseCapture).ok();
+  execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+  terminal.show_cursor().ok();
+}
+
+fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, use_mouse_capture: bool) {
   execute!(terminal.backend_mut(), EnterAlternateScreen).ok();
   if use_mouse_capture {
     execute!(terminal.backend_mut(), EnableMouseCapture).ok();
   }
   enable_raw_mode().ok();
   terminal.clear().ok();
-  Ok(())
 }
 
 pub fn git_reset_hard(cwd: &Path, hash: &str) -> bool {

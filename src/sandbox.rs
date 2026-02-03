@@ -54,8 +54,8 @@ impl Sandbox {
   pub fn new(original: &Path, mode: Mode, prompt: Option<&str>) -> Result<Self, Error> {
     let project = project_name(original).to_string_lossy();
     let ts = chrono::Utc::now().timestamp();
-    let path = PathBuf::from(format!("/tmp/sandbox-{}-{}", project, ts));
-    let task_id = format!("so-{}-{}", project, ts);
+    let path = PathBuf::from(format!("/tmp/sandbox-{project}-{ts}"));
+    let task_id = format!("so-{project}-{ts}");
 
     copy_dir(original, &path)?;
     setup_git(&path, original)?;
@@ -84,7 +84,7 @@ fn parse_sandbox_timestamp(name: &str) -> Option<u64> {
   if project.is_empty() || ts.is_empty() {
     return None;
   }
-  if !ts.as_bytes().iter().all(|b| b.is_ascii_digit()) {
+  if !ts.as_bytes().iter().all(u8::is_ascii_digit) {
     return None;
   }
   ts.parse::<u64>().ok()
@@ -119,38 +119,34 @@ pub fn list() -> Result<Vec<Info>, Error> {
         .as_ref()
         .and_then(|r| r.config().ok())
         .and_then(|c| c.get_string("so.original").ok())
-        .map(|s| PathBuf::from(s.trim()))
-        .unwrap_or_else(|| PathBuf::from("."));
+        .map_or_else(|| PathBuf::from("."), |s| PathBuf::from(s.trim()));
 
       // get git stats
-      let (files_changed, insertions, deletions, commit_count) = repo
-        .as_ref()
-        .map(|r| {
-          let base = git_base(&path, BASE_TAG);
-          let tree = r.revparse_single(&base).ok().and_then(|o| o.peel_to_tree().ok());
-          let diff = tree.and_then(|t| r.diff_tree_to_workdir_with_index(Some(&t), None).ok());
-          let stats = diff.and_then(|d| d.stats().ok());
-          let (f, i, d) =
-            stats.map(|s| (s.files_changed() as u32, s.insertions() as u32, s.deletions() as u32)).unwrap_or((0, 0, 0));
+      let (files_changed, insertions, deletions, commit_count) = repo.as_ref().map_or((0, 0, 0, 0), |r| {
+        let base = git_base(&path, BASE_TAG);
+        let tree = r.revparse_single(&base).ok().and_then(|o| o.peel_to_tree().ok());
+        let diff = tree.and_then(|t| r.diff_tree_to_workdir_with_index(Some(&t), None).ok());
+        let stats = diff.and_then(|d| d.stats().ok());
+        let (f, i, d) =
+          stats.map_or((0, 0, 0), |s| (s.files_changed() as u32, s.insertions() as u32, s.deletions() as u32));
 
-          // count commits
-          let base_oid = r.revparse_single(&base).ok().map(|o| o.id());
-          let head_oid = r.head().ok().and_then(|h| h.target());
-          let commits = match (base_oid, head_oid) {
-            (Some(b), Some(h)) => r
-              .revwalk()
-              .ok()
-              .and_then(|mut w| {
-                w.push(h).ok()?;
-                w.hide(b).ok()?;
-                Some(w.count() as u32)
-              })
-              .unwrap_or(0),
-            _ => 0,
-          };
-          (f, i, d, commits)
-        })
-        .unwrap_or((0, 0, 0, 0));
+        // count commits
+        let base_oid = r.revparse_single(&base).ok().map(|o| o.id());
+        let head_oid = r.head().ok().and_then(|h| h.target());
+        let commits = match (base_oid, head_oid) {
+          (Some(b), Some(h)) => r
+            .revwalk()
+            .ok()
+            .and_then(|mut w| {
+              w.push(h).ok()?;
+              w.hide(b).ok()?;
+              Some(w.count() as u32)
+            })
+            .unwrap_or(0),
+          _ => 0,
+        };
+        (f, i, d, commits)
+      });
 
       out.push(Info {
         name,
@@ -254,18 +250,21 @@ fn get_gid() -> u32 {
   unsafe { libc::getgid() }
 }
 
-async fn image_is_fresh(image: &str, dockerfile: &Path) -> bool {
-  let created = Command::new("docker")
-    .args(["inspect", "-f", "{{.Created}}", image])
+fn dockerfile_hash(dockerfile: &Path) -> Option<String> {
+  std::fs::read(dockerfile).ok().map(|c| format!("{:x}", md5::compute(&c)))
+}
+
+async fn image_has_hash(image: &str, hash: &str) -> bool {
+  Command::new("docker")
+    .args(["inspect", "--format", "{{json .Config.Labels}}", image])
     .output()
     .await
     .ok()
+    .filter(|o| o.status.success())
     .and_then(|o| String::from_utf8(o.stdout).ok())
-    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
-    .map(|dt| dt.with_timezone(&chrono::Utc));
-  let modified =
-    std::fs::metadata(dockerfile).ok().and_then(|m| m.modified().ok()).map(chrono::DateTime::<chrono::Utc>::from);
-  matches!((created, modified), (Some(c), Some(m)) if c >= m)
+    .and_then(|s| serde_json::from_str::<serde_json::Value>(s.trim()).ok())
+    .and_then(|v| v.get("dockerfile.hash").and_then(|h| h.as_str()).map(String::from))
+    .is_some_and(|stored| stored == hash)
 }
 
 fn mount_creds(cmd: &mut Command, creds: &Path, home: &str) {
@@ -289,7 +288,7 @@ fn mount_creds(cmd: &mut Command, creds: &Path, home: &str) {
 }
 
 fn add_env(cmd: &mut Command, key: &str, value: &str) {
-  cmd.args(["-e", &format!("{}={}", key, value)]);
+  cmd.args(["-e", &format!("{key}={value}")]);
 }
 
 fn add_env_if_set(cmd: &mut Command, key: &str) {
@@ -312,21 +311,28 @@ pub async fn start_docker(sb: &Sandbox) -> Result<DockerContainer, Error> {
   }
 
   let home = "/home/ubuntu".to_string();
-  let code = format!("{}/{}", home, project);
+  let code = format!("{home}/{project}");
   let image = format!("sandbox-{}", project.to_lowercase());
 
-  // rebuild image if dockerfile changed
-  if !image_is_fresh(&image, &dockerfile).await {
-    log_activity(sb, "sandbox: building image")?;
+  // check if image matches dockerfile hash
+  let hash = dockerfile_hash(&dockerfile).unwrap_or_default();
+  if image_has_hash(&image, &hash).await {
+    log_activity(sb, "using cached image")?;
+  } else {
+    log_activity(sb, "building image...")?;
     let mut cmd = Command::new("docker");
-    cmd.args(["build", "-q", "-t", &image, "-f"]).arg(&dockerfile).arg(&sb.original);
-    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-    if !cmd.status().await?.success() {
+    cmd
+      .args(["build", "-q", "-t", &image, "--label", &format!("dockerfile.hash={hash}"), "-f"])
+      .arg(&dockerfile)
+      .arg(&sb.original);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    let output = cmd.output().await?;
+    if !output.status.success() {
       return Err(Error::Docker("build failed".into()));
     }
-    log_activity(sb, "sandbox: image built")?;
-  } else {
-    log_activity(sb, "sandbox: using cached image")?;
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let short = if sha.len() > 19 { &sha[7..19] } else { &sha };
+    log_activity(sb, &format!("built image {short}"))?;
   }
 
   let creds = setup_creds()?;
@@ -351,8 +357,8 @@ pub async fn start_docker(sb: &Sandbox) -> Result<DockerContainer, Error> {
   add_env(&mut cmd, "CLAUDE_CODE_TASK_LIST_ID", &sb.task_id);
   add_env(&mut cmd, "SO_UNATTENDED", "1");
   add_env(&mut cmd, "HOME", &home);
-  add_env(&mut cmd, "XDG_CONFIG_HOME", &format!("{}/.config", home));
-  add_env(&mut cmd, "XDG_DATA_HOME", &format!("{}/.local/share", home));
+  add_env(&mut cmd, "XDG_CONFIG_HOME", &format!("{home}/.config"));
+  add_env(&mut cmd, "XDG_DATA_HOME", &format!("{home}/.local/share"));
   add_env(&mut cmd, "OPENCODE_PERMISSION", r#"{"*":"allow"}"#);
   add_env_if_set(&mut cmd, "MODEL");
   add_env_if_set(&mut cmd, "EFFORT");
@@ -365,7 +371,7 @@ pub async fn start_docker(sb: &Sandbox) -> Result<DockerContainer, Error> {
     Ok(o) => o,
     Err(e) => {
       let _ = std::fs::remove_dir_all(&creds);
-      return Err(Error::Docker(format!("spawn failed: {}", e)));
+      return Err(Error::Docker(format!("spawn failed: {e}")));
     }
   };
 
@@ -452,15 +458,12 @@ fn build_bwrap_args(sb: &Sandbox) -> Result<(Vec<OsString>, PathBuf, PathBuf), E
     if_exists_ro(&mut a, &home.join(d));
   }
 
-  // writable tool dirs (tmpfs with optional ro overlays)
-  for (dir, ro_subs) in [(".bun", &[] as &[&str]), (".local", &["bin", "share"])] {
+  // writable tool dirs (pure tmpfs)
+  for dir in [".bun", ".local"] {
     let p = home.join(dir);
     check_dir(&mut a, &mut created_dirs, &p);
     push_arg(&mut a, "--tmpfs");
     push_path(&mut a, &p);
-    for sub in ro_subs {
-      if_exists_ro(&mut a, &p.join(sub));
-    }
   }
 
   // caches (tmpfs)
@@ -497,7 +500,7 @@ fn build_bwrap_args(sb: &Sandbox) -> Result<(Vec<OsString>, PathBuf, PathBuf), E
   // so binary
   let so_dir = std::env::current_exe()
     .ok()
-    .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
     .unwrap_or_else(|| PathBuf::from("/usr/local/bin"));
   push_arg(&mut a, "--ro-bind");
   push_path(&mut a, &so_dir);
@@ -533,7 +536,7 @@ fn build_bwrap_args(sb: &Sandbox) -> Result<(Vec<OsString>, PathBuf, PathBuf), E
     ("PATH", &path),
     ("CLAUDE_CODE_TASK_LIST_ID", &sb.task_id),
     ("TMPDIR", "/tmp"),
-    ("UV_CACHE_DIR", &format!("{}/.cache/uv", h)),
+    ("UV_CACHE_DIR", &format!("{h}/.cache/uv")),
   ] {
     push_env(&mut a, k, v);
   }
@@ -545,7 +548,7 @@ fn build_bwrap_args(sb: &Sandbox) -> Result<(Vec<OsString>, PathBuf, PathBuf), E
 
 fn bwrap_command(args: &[OsString], chdir: &Path, program: &str) -> Command {
   let mut cmd = Command::new("bwrap");
-  cmd.args(args.iter().map(|p| p.as_os_str()));
+  cmd.args(args.iter().map(std::ffi::OsString::as_os_str));
   cmd.arg("--chdir");
   cmd.arg(chdir);
   cmd.arg("--");
@@ -693,13 +696,13 @@ fn copy_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<(), Error> 
 fn setup_git(sandbox: &Path, original: &Path) -> Result<String, Error> {
   let repo = Repository::open(sandbox)?;
   let branch = repo.head()?.shorthand().unwrap_or("main").to_string();
-  let sb_branch = format!("sandbox/{}", branch);
+  let sb_branch = format!("sandbox/{branch}");
   let commit = repo.head()?.peel_to_commit()?;
 
   repo.branch(&sb_branch, &commit, true)?;
-  let obj = repo.revparse_single(&format!("refs/heads/{}", sb_branch))?;
+  let obj = repo.revparse_single(&format!("refs/heads/{sb_branch}"))?;
   repo.checkout_tree(&obj, None)?;
-  repo.set_head(&format!("refs/heads/{}", sb_branch))?;
+  repo.set_head(&format!("refs/heads/{sb_branch}"))?;
 
   // remove remotes
   for name in repo.remotes()?.iter().flatten() {
@@ -732,8 +735,11 @@ fn setup_specs(sandbox: &Path, prompt: Option<&str>, mode: Mode) -> Result<(), E
   // update gitignore
   let gi = sandbox.join(".gitignore");
   if gi.exists() {
-    let mut lines: Vec<_> =
-      std::fs::read_to_string(&gi)?.lines().filter(|l| !l.starts_with("specs")).map(|s| s.to_string()).collect();
+    let mut lines: Vec<_> = std::fs::read_to_string(&gi)?
+      .lines()
+      .filter(|l| !l.starts_with("specs"))
+      .map(std::string::ToString::to_string)
+      .collect();
     if matches!(mode, Mode::Dup) {
       lines.push(".jscpd/".into());
     }
@@ -784,38 +790,20 @@ pub fn git_branch(p: &Path) -> Result<String, Error> {
 }
 
 pub fn git_base(p: &Path, tag: &str) -> String {
-  let repo = match Repository::open(p) {
-    Ok(r) => r,
-    Err(_) => return tag.into(),
-  };
+  let Ok(repo) = Repository::open(p) else { return tag.into() };
   if repo.revparse_single(tag).is_ok() {
     return tag.into();
   }
-  let mut rw = match repo.revwalk() {
-    Ok(r) => r,
-    Err(_) => return tag.into(),
-  };
+  let Ok(mut rw) = repo.revwalk() else { return tag.into() };
   rw.push_head().ok();
-  rw.last().and_then(|r| r.ok()).map(|o| o.to_string()).unwrap_or_else(|| tag.into())
+  rw.last().and_then(std::result::Result::ok).map_or_else(|| tag.into(), |o| o.to_string())
 }
 
 pub fn git_stat(p: &Path, base: &str) -> String {
-  let repo = match Repository::open(p) {
-    Ok(r) => r,
-    Err(_) => return "0 files".into(),
-  };
-  let tree = match repo.revparse_single(base).and_then(|o| o.peel_to_tree()) {
-    Ok(t) => t,
-    Err(_) => return "0 files".into(),
-  };
-  let diff = match repo.diff_tree_to_workdir_with_index(Some(&tree), None) {
-    Ok(d) => d,
-    Err(_) => return "0 files".into(),
-  };
-  let s = match diff.stats() {
-    Ok(s) => s,
-    Err(_) => return "0 files".into(),
-  };
+  let Ok(repo) = Repository::open(p) else { return "0 files".into() };
+  let Ok(tree) = repo.revparse_single(base).and_then(|o| o.peel_to_tree()) else { return "0 files".into() };
+  let Ok(diff) = repo.diff_tree_to_workdir_with_index(Some(&tree), None) else { return "0 files".into() };
+  let Ok(s) = diff.stats() else { return "0 files".into() };
   format!(
     "{} files, {} {}",
     s.files_changed(),
@@ -825,25 +813,14 @@ pub fn git_stat(p: &Path, base: &str) -> String {
 }
 
 pub fn git_recent(p: &Path, base: &str, max: usize) -> String {
-  let repo = match Repository::open(p) {
-    Ok(r) => r,
-    Err(_) => return String::new(),
-  };
-  let base_oid = match repo.revparse_single(base) {
-    Ok(o) => o.id(),
-    Err(_) => return String::new(),
-  };
-  let head = match repo.head().and_then(|h| h.peel_to_commit()) {
-    Ok(c) => c,
-    Err(_) => return String::new(),
-  };
-  let mut rw = match repo.revwalk() {
-    Ok(r) => r,
-    Err(_) => return String::new(),
-  };
+  let Ok(repo) = Repository::open(p) else { return String::new() };
+  let Ok(base_obj) = repo.revparse_single(base) else { return String::new() };
+  let base_oid = base_obj.id();
+  let Ok(head) = repo.head().and_then(|h| h.peel_to_commit()) else { return String::new() };
+  let Ok(mut rw) = repo.revwalk() else { return String::new() };
   rw.push(head.id()).ok();
   rw.hide(base_oid).ok();
-  rw.filter_map(|o| o.ok())
+  rw.filter_map(std::result::Result::ok)
     .filter_map(|o| repo.find_commit(o).ok())
     .take(max)
     .map(|c| {
@@ -863,7 +840,7 @@ pub fn git_commits(p: &Path, base: &str) -> Result<Vec<(String, String)>, Error>
   rw.push(head.id())?;
   rw.hide(base_oid)?;
   Ok(
-    rw.filter_map(|o| o.ok())
+    rw.filter_map(std::result::Result::ok)
       .filter_map(|o| repo.find_commit(o).ok())
       .map(|c| (c.id().to_string(), c.message().unwrap_or("").lines().next().unwrap_or("").into()))
       .collect(),

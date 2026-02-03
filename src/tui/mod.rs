@@ -18,7 +18,7 @@ use crossterm::{
   terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, backend::CrosstermBackend, style::Color};
 use serde_json::Value;
 use tokio::{
   io::{AsyncBufReadExt, BufReader},
@@ -27,9 +27,25 @@ use tokio::{
 };
 
 use crate::{
-  Error, Harness, RunMode, build_prompt,
+  Error, Harness, RunMode,
+  harness::build_prompt,
   sandbox::{BwrapContext, DockerContainer},
 };
+
+// shared color palette
+pub(crate) const BORDER_GRAY: Color = Color::Rgb(70, 70, 70);
+pub(crate) const DIM_GRAY: Color = Color::Rgb(85, 85, 85);
+pub(crate) const MEDIUM_GRAY: Color = Color::Rgb(160, 160, 160);
+pub(crate) const TEXT_WHITE: Color = Color::Rgb(220, 220, 220);
+pub(crate) const GREEN: Color = Color::Rgb(80, 200, 120);
+pub(crate) const YELLOW: Color = Color::Rgb(220, 180, 50);
+pub(crate) const RED: Color = Color::Rgb(220, 80, 80);
+pub(crate) const CYAN: Color = Color::Rgb(80, 180, 200);
+pub(crate) const MAGENTA: Color = Color::Rgb(180, 100, 180);
+
+const SPEC_PLAN: &str = "specs/implementation-plan.md";
+const SPEC_PROMPT: &str = "specs/prompt.md";
+const SPEC_STATUS: &str = "specs/status.md";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConfirmChoice {
@@ -39,8 +55,8 @@ pub(crate) enum ConfirmChoice {
 
 pub(crate) fn confirm_choice(code: KeyCode) -> Option<ConfirmChoice> {
   match code {
-    KeyCode::Char('y') | KeyCode::Char('Y') => Some(ConfirmChoice::Yes),
-    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => Some(ConfirmChoice::No),
+    KeyCode::Char('y' | 'Y') => Some(ConfirmChoice::Yes),
+    KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => Some(ConfirmChoice::No),
     _ => None,
   }
 }
@@ -254,19 +270,17 @@ impl AppState {
   }
 
   pub fn refresh_plan(&mut self, cwd: &Path) {
-    let plan_path = cwd.join("specs/implementation-plan.md");
-    let content = match std::fs::read_to_string(&plan_path) {
-      Ok(c) => c,
-      Err(_) => return,
-    };
+    let plan_path = cwd.join(SPEC_PLAN);
+    let Ok(content) = std::fs::read_to_string(&plan_path) else { return };
     if content == self.plan_raw {
       return;
     }
-    self.plan_raw = content.clone();
-    self.plan_tasks = content
+    self.plan_raw = content;
+    self.plan_tasks = self
+      .plan_raw
       .lines()
       .filter_map(|line| {
-        line.trim_start().strip_prefix("- [ ]").map(|rest| rest.trim()).filter(|t| !t.is_empty()).map(String::from)
+        line.trim_start().strip_prefix("- [ ]").map(str::trim).filter(|t| !t.is_empty()).map(String::from)
       })
       .collect();
   }
@@ -391,7 +405,6 @@ async fn run_loop(
           Some(Ok(Event::Mouse(mouse))) => {
             let _ = handle_term_event(&mut state, TermEvent::Mouse(mouse), terminal, &cwd);
           }
-          Some(Err(_)) | None => {}
           _ => {}
         }
       }
@@ -400,7 +413,7 @@ async fn run_loop(
         handle_harness_event(&mut state, ev);
       }
       // tick for refresh
-      _ = tokio::time::sleep(tick_rate) => {
+      () = tokio::time::sleep(tick_rate) => {
         if last_refresh.elapsed() > Duration::from_millis(500) {
           state.refresh_plan(&cwd);
           last_refresh = Instant::now();
@@ -450,7 +463,7 @@ fn handle_harness_event(state: &mut AppState, event: HarnessEvent) {
     HarnessEvent::Activity { kind, content } => state.add_activity(kind, content),
     HarnessEvent::GitStats { files, ins, del, commits } => state.update_git_stats(files, ins, del, commits),
     HarnessEvent::Error { message } => {
-      state.add_activity(ActivityKind::Text, format!("[error] {}", message));
+      state.add_activity(ActivityKind::Text, format!("[error] {message}"));
       state.popup = RunPopup::Error { message };
       state.error_fatal = true;
     }
@@ -463,19 +476,10 @@ fn handle_harness_event(state: &mut AppState, event: HarnessEvent) {
 }
 
 fn load_activity_log(state: &mut AppState, cwd: &Path) {
-  let repo = match git2::Repository::open(cwd) {
-    Ok(r) => r,
-    Err(_) => return,
-  };
-  let mut cfg = match repo.config() {
-    Ok(c) => c,
-    Err(_) => return,
-  };
+  let Ok(repo) = git2::Repository::open(cwd) else { return };
+  let Ok(mut cfg) = repo.config() else { return };
   {
-    let mut entries = match cfg.entries(Some("so.activity")) {
-      Ok(e) => e,
-      Err(_) => return,
-    };
+    let Ok(mut entries) = cfg.entries(Some("so.activity")) else { return };
     while let Some(entry) = entries.next() {
       if let Ok(e) = entry
         && let Some(v) = e.value()
@@ -745,7 +749,7 @@ async fn run_harness_loop(
   if harness == Harness::Claude
     && let Ok(task_id) = get_task_id(&cwd)
   {
-    let _ = tx.send(HarnessEvent::Activity { kind: ActivityKind::Text, content: format!("tasks: {}", task_id) });
+    let _ = tx.send(HarnessEvent::Activity { kind: ActivityKind::Text, content: format!("tasks: {task_id}") });
   }
 
   for i in start_iter..=max_iter {
@@ -756,14 +760,60 @@ async fn run_harness_loop(
       return;
     }
 
+    if let Err(e) = enforce_commit_tui(harness, &cwd, &tx, backend.as_ref()).await {
+      let _ = tx.send(HarnessEvent::Error { message: e.to_string() });
+      return;
+    }
+
     if check_status_done(&cwd) {
       let _ = tx.send(HarnessEvent::Activity { kind: ActivityKind::Text, content: "status: done".into() });
-      break;
     }
 
     tokio::time::sleep(Duration::from_secs(1)).await;
   }
   let _ = tx.send(HarnessEvent::Finished);
+}
+
+async fn enforce_commit_tui(
+  harness: Harness,
+  cwd: &Path,
+  tx: &mpsc::UnboundedSender<HarnessEvent>,
+  backend: Option<&TuiBackend>,
+) -> Result<(), Error> {
+  let msg = "Commit now. Do not ask questions. Always commit no matter what.\nIf there are no changes, make an empty commit with --allow-empty.\nMessage format:\n- What: <what was done>\n- Why: <reasoning>\n- Alternatives: <what else was considered>";
+  for i in 1..=3 {
+    if !crate::sandbox::git_dirty(cwd).unwrap_or(false) {
+      return Ok(());
+    }
+    let _ = tx.send(HarnessEvent::Activity {
+      kind: ActivityKind::Text,
+      content: format!("warning: uncommitted changes ({i}/3)"),
+    });
+    if run_commit_prompt(harness, msg, cwd, tx, backend).await.is_err() {
+      break;
+    }
+  }
+  if crate::sandbox::git_dirty(cwd).unwrap_or(false) {
+    let _ = tx.send(HarnessEvent::Activity {
+      kind: ActivityKind::Text,
+      content: "error: failed to commit after 3 attempts".into(),
+    });
+  }
+  Ok(())
+}
+
+async fn run_commit_prompt(
+  harness: Harness,
+  prompt: &str,
+  cwd: &Path,
+  tx: &mpsc::UnboundedSender<HarnessEvent>,
+  backend: Option<&TuiBackend>,
+) -> Result<(), Error> {
+  match harness {
+    Harness::Claude => run_claude(prompt, cwd, tx, 0, backend).await,
+    Harness::Opencode => run_opencode(prompt, cwd, tx, 0, backend).await,
+    Harness::Codex => run_codex(prompt, cwd, tx, 0, backend).await,
+  }
 }
 
 async fn run_single_iteration(
@@ -775,7 +825,7 @@ async fn run_single_iteration(
   tx: &mpsc::UnboundedSender<HarnessEvent>,
   backend: Option<&TuiBackend>,
 ) -> Result<(), Error> {
-  let prompt_path = cwd.join("specs/prompt.md");
+  let prompt_path = cwd.join(SPEC_PROMPT);
   let base = std::fs::read_to_string(&prompt_path)?;
   let prompt = build_prompt(&base, mode, cwd, iter, max_iter);
 
@@ -802,7 +852,7 @@ async fn run_claude(
   cmd.args(["-p", "--verbose", "--output-format", "stream-json"]).arg(prompt);
   cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
 
-  let mut child = cmd.spawn().map_err(|e| Error::Harness(format!("claude spawn failed: {}", e)))?;
+  let mut child = cmd.spawn().map_err(|e| Error::Harness(format!("claude spawn failed: {e}")))?;
 
   if let Some(stdout) = child.stdout.take() {
     let mut lines = BufReader::new(stdout).lines();
@@ -834,7 +884,7 @@ async fn run_opencode(
   cmd.args(["run", "--log-level", "INFO", "-m", &model, "--variant", &effort, prompt]);
   cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
-  let mut child = cmd.spawn().map_err(|e| Error::Harness(format!("opencode spawn failed: {}", e)))?;
+  let mut child = cmd.spawn().map_err(|e| Error::Harness(format!("opencode spawn failed: {e}")))?;
   stream_output(&mut child, tx, parse_opencode).await;
 
   let status = child.wait().await?;
@@ -857,11 +907,11 @@ async fn run_codex(
   let effort = env_or_default("EFFORT", "medium");
 
   let mut cmd = harness_cmd(backend, cwd, "codex");
-  let cfg = format!("model_reasoning_effort={}", effort);
+  let cfg = format!("model_reasoning_effort={effort}");
   cmd.args(["exec", "--full-auto", prompt, "--model", &model, "--config", &cfg]);
   cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
-  let mut child = cmd.spawn().map_err(|e| Error::Harness(format!("codex spawn failed: {}", e)))?;
+  let mut child = cmd.spawn().map_err(|e| Error::Harness(format!("codex spawn failed: {e}")))?;
   stream_output(&mut child, tx, parse_codex).await;
 
   let status = child.wait().await?;
@@ -978,7 +1028,7 @@ fn count_commits(repo: &git2::Repository, cwd: &Path) -> Option<u32> {
 }
 
 fn check_status_done(cwd: &Path) -> bool {
-  let status_path = cwd.join("specs/status.md");
+  let status_path = cwd.join(SPEC_STATUS);
   std::fs::read_to_string(status_path).map(|c| c.to_lowercase().contains("status: done")).unwrap_or(false)
 }
 
@@ -1044,10 +1094,7 @@ fn parse_claude(line: &str, tx: &mpsc::UnboundedSender<HarnessEvent>, current_it
 }
 
 fn parse_claude_assistant(j: &Value, tx: &mpsc::UnboundedSender<HarnessEvent>) {
-  let content = match j.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
-    Some(c) => c,
-    None => return,
-  };
+  let Some(content) = j.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) else { return };
 
   for item in content {
     match item.get("type").and_then(|t| t.as_str()) {
@@ -1066,8 +1113,8 @@ fn parse_claude_assistant(j: &Value, tx: &mpsc::UnboundedSender<HarnessEvent>) {
         if let Some(text) = item.get("thinking").and_then(|t| t.as_str()) {
           let first_line = text.lines().next().unwrap_or("thinking...");
           let summary = truncate_chars(first_line, 80);
-          let _ = tx
-            .send(HarnessEvent::Activity { kind: ActivityKind::Thinking, content: format!("[thinking] {}", summary) });
+          let _ =
+            tx.send(HarnessEvent::Activity { kind: ActivityKind::Thinking, content: format!("[thinking] {summary}") });
         }
       }
       Some("tool_use") => parse_claude_tool(item, tx),
@@ -1091,8 +1138,7 @@ fn parse_claude_tool(item: &Value, tx: &mpsc::UnboundedSender<HarnessEvent>) {
     }
     "Bash" => {
       let cmd = input.and_then(|i| i.get("command")).and_then(|c| c.as_str()).unwrap_or("?");
-      let short = if cmd.chars().count() > 60 { cmd.chars().take(60).collect() } else { cmd.to_string() };
-      (ActivityKind::ToolCall, short)
+      (ActivityKind::ToolCall, truncate_chars(cmd, 60))
     }
     "Glob" | "Grep" => {
       let pattern = input.and_then(|i| i.get("pattern")).and_then(|p| p.as_str()).unwrap_or("?");
@@ -1100,7 +1146,7 @@ fn parse_claude_tool(item: &Value, tx: &mpsc::UnboundedSender<HarnessEvent>) {
     }
     "Task" => {
       let desc = input.and_then(|i| i.get("description")).and_then(|d| d.as_str()).unwrap_or("agent");
-      (ActivityKind::ToolCall, format!("spawning {}", desc))
+      (ActivityKind::ToolCall, format!("spawning {desc}"))
     }
     _ => (ActivityKind::ToolCall, tool_name.to_lowercase()),
   };
@@ -1112,9 +1158,9 @@ fn parse_claude_result(j: &Value, tx: &mpsc::UnboundedSender<HarnessEvent>, curr
     let _ = tx.send(HarnessEvent::IterationComplete { n: current_iter, diff: None, msg: None });
   }
   if let Some(result) = j.get("result")
-    && let Some(cost) = result.get("cost_usd").and_then(|c| c.as_f64())
+    && let Some(cost) = result.get("cost_usd").and_then(serde_json::Value::as_f64)
   {
-    let _ = tx.send(HarnessEvent::Activity { kind: ActivityKind::Text, content: format!("cost: ${:.4}", cost) });
+    let _ = tx.send(HarnessEvent::Activity { kind: ActivityKind::Text, content: format!("cost: ${cost:.4}") });
   }
 }
 
@@ -1122,7 +1168,7 @@ fn parse_claude_system(j: &Value, tx: &mpsc::UnboundedSender<HarnessEvent>) {
   if let Some(msg) = j.get("message").and_then(|m| m.as_str())
     && (msg.contains("error") || msg.contains("Error"))
   {
-    let _ = tx.send(HarnessEvent::Activity { kind: ActivityKind::Text, content: format!("[error] {}", msg) });
+    let _ = tx.send(HarnessEvent::Activity { kind: ActivityKind::Text, content: format!("[error] {msg}") });
   }
 }
 
@@ -1138,29 +1184,29 @@ fn parse_opencode(line: &str, tx: &mpsc::UnboundedSender<HarnessEvent>) {
     return;
   }
 
-  let (kind, content) = if trimmed.contains("Read") && trimmed.contains("|") {
+  let (kind, content) = if trimmed.contains("Read") && trimmed.contains('|') {
     let path = trimmed.split("Read").last().unwrap_or("").trim();
     (ActivityKind::Reading, path.to_string())
-  } else if (trimmed.contains("Write") || trimmed.contains("apply_patch")) && trimmed.contains("|") {
+  } else if (trimmed.contains("Write") || trimmed.contains("apply_patch")) && trimmed.contains('|') {
     let rest = if trimmed.contains("apply_patch") {
       "patch applied".to_string()
     } else {
       trimmed.split("Write").last().unwrap_or("").trim().to_string()
     };
     (ActivityKind::Writing, rest)
-  } else if trimmed.contains("Edit") && trimmed.contains("|") {
+  } else if trimmed.contains("Edit") && trimmed.contains('|') {
     let path = trimmed.split("Edit").last().unwrap_or("").trim();
     (ActivityKind::Writing, path.to_string())
-  } else if (trimmed.contains("Bash") || trimmed.contains("Shell")) && trimmed.contains("|") {
+  } else if (trimmed.contains("Bash") || trimmed.contains("Shell")) && trimmed.contains('|') {
     let cmd = trimmed.split('|').next_back().unwrap_or("").trim();
     let cmd_clean = cmd.replace("Bash", "").replace("Shell", "").trim().to_string();
     (ActivityKind::ToolCall, cmd_clean)
-  } else if trimmed.contains("Glob") && trimmed.contains("|") {
+  } else if trimmed.contains("Glob") && trimmed.contains('|') {
     let rest = trimmed.split("Glob").last().unwrap_or("").trim();
-    (ActivityKind::ToolCall, format!("glob {}", rest))
-  } else if trimmed.contains("Grep") && trimmed.contains("|") {
+    (ActivityKind::ToolCall, format!("glob {rest}"))
+  } else if trimmed.contains("Grep") && trimmed.contains('|') {
     let rest = trimmed.split("Grep").last().unwrap_or("").trim();
-    (ActivityKind::ToolCall, format!("grep {}", rest))
+    (ActivityKind::ToolCall, format!("grep {rest}"))
   } else {
     (ActivityKind::Text, trimmed.to_string())
   };
@@ -1196,7 +1242,7 @@ fn parse_codex(line: &str, tx: &mpsc::UnboundedSender<HarnessEvent>) {
   }
 
   let (kind, content) = if trimmed.starts_with("/bin/bash") || trimmed.starts_with("$ ") {
-    let cmd = if trimmed.contains("'") {
+    let cmd = if trimmed.contains('\'') {
       trimmed.split('\'').nth(1).unwrap_or(trimmed)
     } else if let Some(rest) = trimmed.strip_prefix("$ ") {
       rest

@@ -8,14 +8,8 @@ use ratatui::{
   widgets::{Clear, List, ListItem, Paragraph},
 };
 
+use super::{BORDER_GRAY, DIM_GRAY, GREEN, RED, TEXT_WHITE, YELLOW};
 use crate::sandbox;
-
-const BORDER_GRAY: Color = Color::Rgb(70, 70, 70);
-const DIM_GRAY: Color = Color::Rgb(110, 110, 110);
-const TEXT_WHITE: Color = Color::Rgb(220, 220, 220);
-const GREEN: Color = Color::Rgb(80, 200, 120);
-const RED: Color = Color::Rgb(220, 80, 80);
-const YELLOW: Color = Color::Rgb(220, 180, 50);
 
 pub struct DetailPopupData<'a> {
   pub path: &'a Path,
@@ -33,7 +27,7 @@ pub fn render_detail_popup(frame: &mut Frame, area: Rect, data: &DetailPopupData
   let mut lines: Vec<Line> = Vec::new();
 
   lines.push(popup_header("", width, BORDER_GRAY));
-  lines.push(popup_empty(width));
+  lines.push(detail_empty(width));
 
   // path (yellow)
   let path_str = data.path.display().to_string();
@@ -43,8 +37,8 @@ pub fn render_detail_popup(frame: &mut Frame, area: Rect, data: &DetailPopupData
   } else {
     path_str
   };
-  let path_content = format!(" {}", path_display);
-  lines.push(popup_line(&path_content, width, YELLOW));
+  let path_content = format!(" {path_display}");
+  lines.push(popup_line(&path_content, width, YELLOW, BORDER_GRAY));
 
   // stats with colored +/-
   let plus = format!("+{}", data.insertions);
@@ -57,7 +51,7 @@ pub fn render_detail_popup(frame: &mut Frame, area: Rect, data: &DetailPopupData
   let stats_pad = width.saturating_sub(stats_len + 2);
   lines.push(Line::from(vec![
     Span::styled("│", Style::default().fg(BORDER_GRAY)),
-    Span::styled(format!(" {}", plus), Style::default().fg(GREEN)),
+    Span::styled(format!(" {plus}"), Style::default().fg(GREEN)),
     Span::styled("/", Style::default().fg(TEXT_WHITE)),
     Span::styled(minus, Style::default().fg(RED)),
     Span::styled(rest, Style::default().fg(DIM_GRAY)),
@@ -65,12 +59,12 @@ pub fn render_detail_popup(frame: &mut Frame, area: Rect, data: &DetailPopupData
     Span::styled("│", Style::default().fg(BORDER_GRAY)),
   ]));
 
-  lines.push(popup_empty(width));
+  lines.push(detail_empty(width));
 
   lines.push(popup_separator(width, BORDER_GRAY));
 
   let actions = " d diff  s shell  r reset  m merge  c continue";
-  lines.push(popup_line(actions, width, TEXT_WHITE));
+  lines.push(popup_line(actions, width, TEXT_WHITE, BORDER_GRAY));
 
   lines.push(popup_footer(" Esc back ", width, BORDER_GRAY));
 
@@ -92,7 +86,7 @@ pub fn render_error_popup(frame: &mut Frame, area: Rect, message: &str) {
   } else {
     message.to_string()
   };
-  lines.push(error_line(&format!(" {}", msg_display), width, TEXT_WHITE));
+  lines.push(popup_line(&format!(" {msg_display}"), width, TEXT_WHITE, RED));
 
   // empty line
   lines.push(error_empty(width));
@@ -130,7 +124,7 @@ pub fn render_reset_popup(frame: &mut Frame, area: Rect, commits: &[(String, Str
       };
 
       let bg = if idx == selected { Color::Rgb(40, 40, 50) } else { Color::Reset };
-      let hash_part = format!(" {} ", short_hash);
+      let hash_part = format!(" {short_hash} ");
       let content_len = hash_part.chars().count() + msg_display.chars().count();
       let padding = width.saturating_sub(content_len + 2);
 
@@ -209,21 +203,21 @@ pub fn render_merge_popup(
   } else {
     orig_str
   };
-  lines.push(popup_line(&format!(" {}", orig_display), width, YELLOW));
+  lines.push(popup_line(&format!(" {orig_display}"), width, YELLOW, BORDER_GRAY));
 
   let branch = sandbox::git_branch(orig).unwrap_or_else(|_| "main".into());
-  lines.push(popup_line(&format!(" {}", branch), width, DIM_GRAY));
+  lines.push(popup_line(&format!(" {branch}"), width, DIM_GRAY, BORDER_GRAY));
 
-  let plus = format!("+{}", insertions);
-  let minus = format!("-{}", deletions);
+  let plus = format!("+{insertions}");
+  let minus = format!("-{deletions}");
   let files_word = if files_changed == 1 { "file" } else { "files" };
   let commits_word = if commit_count == 1 { "commit" } else { "commits" };
-  let rest = format!(" ({} {})  {} {}", files_changed, files_word, commit_count, commits_word);
+  let rest = format!(" ({files_changed} {files_word})  {commit_count} {commits_word}");
   let stats_len = 1 + plus.chars().count() + 1 + minus.chars().count() + rest.chars().count();
   let stats_pad = width.saturating_sub(stats_len + 2);
   lines.push(Line::from(vec![
     Span::styled("│", Style::default().fg(BORDER_GRAY)),
-    Span::styled(format!(" {}", plus), Style::default().fg(GREEN)),
+    Span::styled(format!(" {plus}"), Style::default().fg(GREEN)),
     Span::styled("/", Style::default().fg(TEXT_WHITE)),
     Span::styled(minus, Style::default().fg(RED)),
     Span::styled(rest, Style::default().fg(DIM_GRAY)),
@@ -237,34 +231,25 @@ pub fn render_merge_popup(
   render_lines(frame, popup_area, lines);
 }
 
-fn centered_fixed(percent_x: u16, height: u16, r: Rect) -> Rect {
+pub(super) fn centered_fixed(percent_x: u16, height: u16, r: Rect) -> Rect {
   let top_pad = r.height.saturating_sub(height) / 2;
-  let popup_width = (r.width as u32 * percent_x as u32 / 100) as u16;
+  let popup_width = (u32::from(r.width) * u32::from(percent_x) / 100) as u16;
   let left_pad = r.width.saturating_sub(popup_width) / 2;
 
   Rect { x: r.x + left_pad, y: r.y + top_pad, width: popup_width.min(r.width), height: height.min(r.height) }
 }
 
-fn popup_empty(width: usize) -> Line<'static> {
-  let padding = width.saturating_sub(2);
-  Line::from(vec![
-    Span::styled("│", Style::default().fg(BORDER_GRAY)),
-    Span::raw(" ".repeat(padding)),
-    Span::styled("│", Style::default().fg(BORDER_GRAY)),
-  ])
-}
-
-fn popup_line(text: &str, width: usize, color: Color) -> Line<'static> {
+fn popup_line(text: &str, width: usize, text_color: Color, border_color: Color) -> Line<'static> {
   let padding = width.saturating_sub(text.chars().count() + 2);
   Line::from(vec![
-    Span::styled("│", Style::default().fg(BORDER_GRAY)),
-    Span::styled(text.to_string(), Style::default().fg(color)),
+    Span::styled("│", Style::default().fg(border_color)),
+    Span::styled(text.to_string(), Style::default().fg(text_color)),
     Span::raw(" ".repeat(padding)),
-    Span::styled("│", Style::default().fg(BORDER_GRAY)),
+    Span::styled("│", Style::default().fg(border_color)),
   ])
 }
 
-fn popup_header(label: &str, width: usize, border_color: Color) -> Line<'static> {
+pub(super) fn popup_header(label: &str, width: usize, border_color: Color) -> Line<'static> {
   let dashes = width.saturating_sub(label.chars().count() + 2);
   let label_span = if label.is_empty() {
     Span::styled("─".repeat(dashes), Style::default().fg(border_color))
@@ -280,7 +265,7 @@ fn popup_header(label: &str, width: usize, border_color: Color) -> Line<'static>
   ])
 }
 
-fn popup_footer(keys: &str, width: usize, border_color: Color) -> Line<'static> {
+pub(super) fn popup_footer(keys: &str, width: usize, border_color: Color) -> Line<'static> {
   let dashes = width.saturating_sub(keys.chars().count() + 2);
   Line::from(vec![
     Span::styled("└", Style::default().fg(border_color)),
@@ -315,7 +300,7 @@ fn render_lines(frame: &mut Frame, area: Rect, lines: Vec<Line>) {
   }
 }
 
-fn detail_empty(width: usize) -> Line<'static> {
+pub(super) fn detail_empty(width: usize) -> Line<'static> {
   let padding = width.saturating_sub(2);
   Line::from(vec![
     Span::styled("│", Style::default().fg(BORDER_GRAY)),
@@ -324,20 +309,10 @@ fn detail_empty(width: usize) -> Line<'static> {
   ])
 }
 
-fn error_empty(width: usize) -> Line<'static> {
+pub(super) fn error_empty(width: usize) -> Line<'static> {
   let padding = width.saturating_sub(2);
   Line::from(vec![
     Span::styled("│", Style::default().fg(RED)),
-    Span::raw(" ".repeat(padding)),
-    Span::styled("│", Style::default().fg(RED)),
-  ])
-}
-
-fn error_line(text: &str, width: usize, color: Color) -> Line<'static> {
-  let padding = width.saturating_sub(text.chars().count() + 2);
-  Line::from(vec![
-    Span::styled("│", Style::default().fg(RED)),
-    Span::styled(text.to_string(), Style::default().fg(color)),
     Span::raw(" ".repeat(padding)),
     Span::styled("│", Style::default().fg(RED)),
   ])
