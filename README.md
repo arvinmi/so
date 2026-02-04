@@ -132,3 +132,15 @@ so run -H opencode -m openai/gpt-5.2-codex -e medium
 ```
 
 > Note: Setting `SANDBOX` as an environment variable is the same as `--sandbox`.
+
+Set persistent defaults in `~/.config/so/config.toml`:
+
+```toml
+harness = "opencode"
+iterations = 5
+sandbox = "docker"
+model = "openai/gpt-5.2-codex"
+effort = "medium"
+```
+
+> Note: All fields are optional. CLI flags take priority.
