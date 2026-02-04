@@ -992,10 +992,7 @@ fn harness_cmd(backend: Option<&TuiBackend>, cwd: &Path, program: &str) -> Comma
 
 fn update_git_stats_state(state: &mut AppState, cwd: &Path) {
   if let Some((files, ins, del, commits)) = collect_git_stats(cwd) {
-    state.files_changed = files;
-    state.insertions = ins;
-    state.deletions = del;
-    state.commit_count = commits;
+    state.update_git_stats(files, ins, del, commits);
   }
 }
 

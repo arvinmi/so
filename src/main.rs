@@ -613,7 +613,7 @@ async fn run_sandbox_iterations(
 }
 
 async fn continue_sandbox(sandbox_path: &Path, iterations: u32) -> Result<(), Error> {
-  let sb_name = sandbox_name_from_path(sandbox_path);
+  let sb_name = sandbox_name(sandbox_path);
   let meta = config::read_meta(&sb_name).ok_or(Error::SandboxMetadataMissing)?;
   let harness = parse_harness(&meta.harness).ok_or(Error::SandboxMetadataMissing)?;
   let sandbox_type = parse_sandbox_type(&meta.sandbox).ok_or(Error::SandboxMetadataMissing)?;
@@ -645,16 +645,12 @@ fn warn_gpu_if_missing(st: SandboxType) {
   }
 }
 
-fn sandbox_name(original: &Path) -> String {
-  original.file_name().map_or_else(|| "sandbox".into(), |n| n.to_string_lossy().to_string())
-}
-
-fn sandbox_name_from_path(sandbox_path: &Path) -> String {
-  sandbox_path.file_name().map_or_else(|| "sandbox".into(), |n| n.to_string_lossy().to_string())
+fn sandbox_name(p: &Path) -> String {
+  p.file_name().map_or_else(|| "sandbox".into(), |n| n.to_string_lossy().to_string())
 }
 
 fn write_sandbox_meta(sb: &sandbox::Sandbox, harness: Harness, sandbox_type: SandboxType) {
-  let sb_name = sandbox_name_from_path(&sb.path);
+  let sb_name = sandbox_name(&sb.path);
   config::write_meta(
     &sb_name,
     &config::SandboxMeta {

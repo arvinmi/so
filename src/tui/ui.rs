@@ -131,8 +131,9 @@ fn render_iterations_section(frame: &mut Frame, area: Rect, state: &AppState) {
 
   // content with side borders
   let visible_height = content_area.height as usize;
-  const SPINNER: &[&str] = &["◐", "◓", "◑", "◒"];
+  let spin = ["◐", "◓", "◑", "◒"];
   let spin_idx = (state.start_time.elapsed().as_millis() / 1500 % 4) as usize;
+
   let items: Vec<ListItem> = state
     .iterations
     .iter()
@@ -140,42 +141,33 @@ fn render_iterations_section(frame: &mut Frame, area: Rect, state: &AppState) {
     .take(visible_height)
     .enumerate()
     .map(|(idx, iter)| {
-      let (icon, icon_color) = match iter.status {
+      let (icon, color) = match iter.status {
         IterStatus::Pending => ("○", DIM_GRAY),
-        IterStatus::Running => (SPINNER[spin_idx], YELLOW),
-        IterStatus::Completed => {
-          // green if committed, red if not
-          if iter.commit_msg.is_some() { ("●", GREEN) } else { ("●", RED) }
-        }
+        IterStatus::Running => (spin[spin_idx], YELLOW),
+        IterStatus::Completed if iter.commit_msg.is_some() => ("●", GREEN),
+        IterStatus::Completed => ("●", RED),
       };
 
-      // get task from all_tasks, fall back to status desc
       let task = state.all_tasks.get(state.iter_scroll_offset + idx).cloned().unwrap_or_else(|| match iter.status {
         IterStatus::Pending => "pending".into(),
         IterStatus::Running => "running...".into(),
         IterStatus::Completed => iter.commit_msg.clone().unwrap_or_else(|| "completed".into()),
       });
 
-      let duration = iter.elapsed().map_or_else(|| "[--:--]".into(), |d| format!("[{}]", fmt_duration_short(d)));
-
-      // ● 1   Task from implementation plan [00:45]
-      // leave room for icon, num, duration, borders
-      let max_task_len = width.saturating_sub(20);
-      let task_display = truncate_str(&task, max_task_len);
-
-      let inner = format!(" {} {:<2}  {} {}", icon, iter.number, task_display, duration);
-      let inner_len = inner.chars().count();
-      // 2 for side borders
-      let padding = width.saturating_sub(inner_len + 2);
+      let dur = iter.elapsed().map_or_else(|| "[--:--]".into(), |d| format!("[{}]", fmt_duration_short(d)));
+      let num = format!("{:>2}", iter.number);
+      let max_task = width.saturating_sub(9 + dur.chars().count());
+      let task_str = truncate_str(&task, max_task);
+      let pad = width.saturating_sub(8 + task_str.width() + dur.chars().count());
 
       let line = Line::from(vec![
         Span::styled("│", Style::default().fg(BORDER_GRAY)),
-        Span::styled(format!(" {icon} "), Style::default().fg(icon_color)),
-        Span::styled(format!("{:<2}  ", iter.number), Style::default().fg(TEXT_WHITE)),
-        Span::styled(task_display, Style::default().fg(TEXT_WHITE)),
+        Span::styled(format!(" {icon} "), Style::default().fg(color)),
+        Span::styled(format!("{num}  "), Style::default().fg(TEXT_WHITE)),
+        Span::styled(task_str, Style::default().fg(TEXT_WHITE)),
         Span::raw(" "),
-        Span::styled(duration, Style::default().fg(DIM_GRAY)),
-        Span::raw(" ".repeat(padding)),
+        Span::styled(dur, Style::default().fg(DIM_GRAY)),
+        Span::raw(" ".repeat(pad)),
         Span::styled("│", Style::default().fg(BORDER_GRAY)),
       ]);
 
