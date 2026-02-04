@@ -750,7 +750,7 @@ fn copy_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<(), Error> 
 // Git setup
 // =============================================================================
 
-fn setup_git(sandbox: &Path) -> Result<String, Error> {
+fn setup_git(sandbox: &Path) -> Result<(), Error> {
   let repo = Repository::open(sandbox)?;
   let branch = repo.head()?.shorthand().unwrap_or("main").to_string();
   let sb_branch = format!("sandbox/{branch}");
@@ -777,7 +777,7 @@ fn setup_git(sandbox: &Path) -> Result<String, Error> {
   let mut cfg = repo.config()?;
   cfg.set_str("receive.denyCurrentBranch", "updateInstead")?;
 
-  Ok(sb_branch)
+  Ok(())
 }
 
 fn setup_specs(sandbox: &Path, prompt: Option<&str>, mode: Mode) -> Result<(), Error> {
