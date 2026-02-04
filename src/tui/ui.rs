@@ -131,6 +131,8 @@ fn render_iterations_section(frame: &mut Frame, area: Rect, state: &AppState) {
 
   // content with side borders
   let visible_height = content_area.height as usize;
+  const SPINNER: &[&str] = &["◐", "◓", "◑", "◒"];
+  let spin_idx = (state.start_time.elapsed().as_millis() / 1500 % 4) as usize;
   let items: Vec<ListItem> = state
     .iterations
     .iter()
@@ -140,7 +142,7 @@ fn render_iterations_section(frame: &mut Frame, area: Rect, state: &AppState) {
     .map(|(idx, iter)| {
       let (icon, icon_color) = match iter.status {
         IterStatus::Pending => ("○", DIM_GRAY),
-        IterStatus::Running => ("◐", YELLOW),
+        IterStatus::Running => (SPINNER[spin_idx], YELLOW),
         IterStatus::Completed => {
           // green if committed, red if not
           if iter.commit_msg.is_some() { ("●", GREEN) } else { ("●", RED) }
