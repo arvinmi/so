@@ -201,6 +201,7 @@ pub struct AppState {
   pub restart_harness: bool,
   pub restart_from: Option<u32>,
   pub plan_tasks: Vec<String>,
+  pub all_tasks: Vec<String>,
   plan_raw: String,
 }
 
@@ -233,6 +234,7 @@ impl AppState {
       restart_harness: false,
       restart_from: None,
       plan_tasks: Vec::new(),
+      all_tasks: Vec::new(),
       plan_raw: String::new(),
     }
   }
@@ -280,6 +282,21 @@ impl AppState {
       .lines()
       .filter_map(|line| {
         line.trim_start().strip_prefix("- [ ]").map(str::trim).filter(|t| !t.is_empty()).map(String::from)
+      })
+      .collect();
+    // all tasks (checked + unchecked) for iteration display
+    self.all_tasks = self
+      .plan_raw
+      .lines()
+      .filter_map(|line| {
+        let trimmed = line.trim_start();
+        trimmed
+          .strip_prefix("- [ ]")
+          .or_else(|| trimmed.strip_prefix("- [x]"))
+          .or_else(|| trimmed.strip_prefix("- [X]"))
+          .map(str::trim)
+          .filter(|t| !t.is_empty())
+          .map(String::from)
       })
       .collect();
   }
@@ -347,6 +364,7 @@ pub async fn run(
   max_iter: u32,
   cwd: PathBuf,
   backend: Option<TuiBackend>,
+  initial_activity: Vec<String>,
 ) -> Result<(), Error> {
   enable_raw_mode().map_err(|e| Error::RawModeEnable(e.to_string()))?;
   let mut stdout = io::stdout();
@@ -354,7 +372,7 @@ pub async fn run(
   let term_backend = CrosstermBackend::new(stdout);
   let mut terminal = Terminal::new(term_backend).map_err(|e| Error::TerminalCreate(e.to_string()))?;
 
-  let result = run_loop(&mut terminal, sandbox_name, harness, mode, max_iter, cwd, backend).await;
+  let result = run_loop(&mut terminal, sandbox_name, harness, mode, max_iter, cwd, backend, initial_activity).await;
 
   disable_raw_mode().ok();
   execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
@@ -363,6 +381,7 @@ pub async fn run(
   result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
   terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
   sandbox_name: String,
@@ -371,10 +390,13 @@ async fn run_loop(
   max_iter: u32,
   cwd: PathBuf,
   backend: Option<TuiBackend>,
+  initial_activity: Vec<String>,
 ) -> Result<(), Error> {
   let mut state = AppState::new(sandbox_name, cwd.clone(), harness.as_str().into(), max_iter);
   state.refresh_plan(&cwd);
-  load_activity_log(&mut state, &cwd);
+  for msg in initial_activity {
+    state.add_activity(ActivityKind::Text, msg);
+  }
 
   let (harness_tx, mut harness_rx) = mpsc::unbounded_channel::<HarnessEvent>();
   let mut harness_handle =
@@ -476,25 +498,6 @@ fn handle_harness_event(state: &mut AppState, event: HarnessEvent) {
       state.popup = RunPopup::Options;
     }
   }
-}
-
-fn load_activity_log(state: &mut AppState, cwd: &Path) {
-  let Ok(repo) = git2::Repository::open(cwd) else { return };
-  let Ok(mut cfg) = repo.config() else { return };
-  {
-    let Ok(mut entries) = cfg.entries(Some("so.activity")) else { return };
-    while let Some(entry) = entries.next() {
-      if let Ok(e) = entry
-        && let Some(v) = e.value()
-      {
-        let v = v.trim();
-        if !v.is_empty() {
-          state.add_activity(ActivityKind::Text, v.to_string());
-        }
-      }
-    }
-  }
-  let _ = cfg.remove_multivar("so.activity", ".*");
 }
 
 fn handle_term_event(
@@ -669,8 +672,12 @@ fn handle_popup_continue(
     KeyCode::Enter => {
       // sync iteration state with git in case of external reset
       refresh_iterations_from_commits(state, cwd);
+      state.refresh_plan(cwd);
       let extra: u32 = input.parse().unwrap_or(10);
-      state.max_iter = state.current_iter + extra;
+      // cap by remaining uncompleted tasks
+      let tasks = state.plan_tasks.len() as u32;
+      let capped = if tasks > 0 { extra.min(tasks) } else { extra };
+      state.max_iter = state.current_iter + capped;
       state.iterations.truncate(state.current_iter as usize);
       for n in (state.current_iter + 1)..=(state.max_iter) {
         state.iterations.push(Iteration::new(n));
@@ -1284,7 +1291,6 @@ fn parse_codex(line: &str, tx: &mpsc::UnboundedSender<HarnessEvent>) {
 // =============================================================================
 
 fn get_task_id(cwd: &Path) -> Result<String, Error> {
-  let repo = git2::Repository::open(cwd)?;
-  let cfg = repo.config()?;
-  cfg.get_string("so.mdata.task-id").map_err(Error::Git)
+  let name = cwd.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+  crate::config::read_meta(&name).map(|m| m.task_id).ok_or(Error::SandboxMetadataMissing)
 }

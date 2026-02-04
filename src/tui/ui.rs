@@ -147,8 +147,8 @@ fn render_iterations_section(frame: &mut Frame, area: Rect, state: &AppState) {
         }
       };
 
-      // get task from plan_tasks, fall back to status desc
-      let task = state.plan_tasks.get(state.iter_scroll_offset + idx).cloned().unwrap_or_else(|| match iter.status {
+      // get task from all_tasks, fall back to status desc
+      let task = state.all_tasks.get(state.iter_scroll_offset + idx).cloned().unwrap_or_else(|| match iter.status {
         IterStatus::Pending => "pending".into(),
         IterStatus::Running => "running...".into(),
         IterStatus::Completed => iter.commit_msg.clone().unwrap_or_else(|| "completed".into()),

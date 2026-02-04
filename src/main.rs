@@ -1,3 +1,4 @@
+mod config;
 mod harness;
 mod sandbox;
 mod tui;
@@ -15,7 +16,6 @@ use clap::{
   builder::{Styles, styling::AnsiColor},
 };
 use colored::Colorize;
-use git2::Repository;
 use sandbox::{GpuStatus, SandboxType};
 use thiserror::Error;
 
@@ -127,12 +127,12 @@ const STYLES: Styles = Styles::plain().header(AnsiColor::White.on_default().unde
 )]
 struct Cli {
   /// Agent harness to use
-  #[arg(short = 'H', long, global = true, default_value = "claude", value_enum)]
-  harness: Harness,
+  #[arg(short = 'H', long, global = true, value_enum)]
+  harness: Option<Harness>,
 
   /// Number of iterations
-  #[arg(short = 'i', long, global = true, default_value = "10")]
-  iterations: u32,
+  #[arg(short = 'i', long, global = true)]
+  iterations: Option<u32>,
 
   /// Model override
   #[arg(short, long, global = true)]
@@ -143,8 +143,8 @@ struct Cli {
   effort: Option<String>,
 
   /// Sandbox type
-  #[arg(short, long, global = true, env = "SANDBOX", default_value = "docker", value_enum)]
-  sandbox: SandboxType,
+  #[arg(short, long, global = true, env = "SANDBOX", value_enum)]
+  sandbox: Option<SandboxType>,
 
   #[command(subcommand)]
   command: Option<Cmd>,
@@ -208,11 +208,18 @@ async fn run() -> Result<(), Error> {
 }
 
 async fn run_inner() -> Result<(), Error> {
+  sandbox::cleanup_stale_creds();
+  config::prune_stale();
+
   let cli = Cli::parse();
-  let h = cli.harness;
-  let model = cli.model;
-  let effort = cli.effort;
-  let st = cli.sandbox;
+  let cfg = config::load();
+
+  // resolve CLI arg > config.toml > default
+  let h = cli.harness.or_else(|| cfg.harness.as_deref().and_then(parse_harness)).unwrap_or(Harness::Claude);
+  let iterations = cli.iterations.or(cfg.iterations).unwrap_or(10);
+  let st = cli.sandbox.or_else(|| cfg.sandbox.as_deref().and_then(parse_sandbox_type)).unwrap_or(SandboxType::Docker);
+  let model = cli.model.or(cfg.model);
+  let effort = cli.effort.or(cfg.effort);
 
   // set env vars for harness runners
   if let Some(m) = &model {
@@ -227,12 +234,12 @@ async fn run_inner() -> Result<(), Error> {
       if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return Err(Error::RunRequiresTerminal);
       }
-      do_run(h, cli.iterations, st).await
+      do_run(h, iterations, st).await
     }
-    Cmd::Step => do_step(h, cli.iterations).await,
+    Cmd::Step => do_step(h, iterations).await,
     Cmd::Plan => do_plan(h).await,
-    Cmd::Clean => do_clean(h, cli.iterations, st).await,
-    Cmd::Dup => do_dup(h, cli.iterations, st).await,
+    Cmd::Clean => do_clean(h, iterations, st).await,
+    Cmd::Dup => do_dup(h, iterations, st).await,
     Cmd::Learn => do_learn(h).await,
     Cmd::Menu => do_menu().await,
   }
@@ -350,7 +357,7 @@ async fn do_run(harness: Harness, iterations: u32, st: SandboxType) -> Result<()
   }
 
   let sb = sandbox::Sandbox::new(&cwd, sandbox::Mode::Run, None)?;
-  set_mdata(&sb.path, harness, st, &sb.task_id)?;
+  write_sandbox_meta(&sb, harness, st);
 
   let effective_max = effective_max(&sb.path, iterations);
   finalize_sandbox(&sb, harness, effective_max, st).await
@@ -398,7 +405,7 @@ async fn run_with_prompt(
   }
 
   let sb = sandbox::Sandbox::new(&cwd, mode, Some(prompt))?;
-  set_mdata(&sb.path, harness, st, &sb.task_id)?;
+  write_sandbox_meta(&sb, harness, st);
 
   finalize_sandbox(&sb, harness, iterations, st).await
 }
@@ -570,7 +577,8 @@ async fn run_sandbox_iterations(
   };
   match st {
     SandboxType::Docker => {
-      let container = Arc::new(sandbox::start_docker(sb).await?);
+      let (container, build_messages) = sandbox::start_docker(sb).await?;
+      let container = Arc::new(container);
       let name = sandbox_name(&sb.original);
       let result = tui::run(
         name,
@@ -579,6 +587,7 @@ async fn run_sandbox_iterations(
         iterations,
         sb.path.clone(),
         Some(tui::TuiBackend::Docker(container.clone())),
+        build_messages,
       )
       .await;
       container.stop().await;
@@ -588,24 +597,30 @@ async fn run_sandbox_iterations(
       let bwrap = Arc::new(sandbox::BwrapContext::new(sb)?);
       let name = sandbox_name(&sb.original);
       outcome(
-        tui::run(name, harness, RunMode::Run, iterations, sb.path.clone(), Some(tui::TuiBackend::Bwrap(bwrap))).await,
+        tui::run(
+          name,
+          harness,
+          RunMode::Run,
+          iterations,
+          sb.path.clone(),
+          Some(tui::TuiBackend::Bwrap(bwrap)),
+          Vec::new(),
+        )
+        .await,
       )
     }
   }
 }
 
 async fn continue_sandbox(sandbox_path: &Path, iterations: u32) -> Result<(), Error> {
-  let mdata = read_mdata(sandbox_path)?;
-  validate_sandbox(mdata.sandbox)?;
+  let sb_name = sandbox_name_from_path(sandbox_path);
+  let meta = config::read_meta(&sb_name).ok_or(Error::SandboxMetadataMissing)?;
+  let harness = parse_harness(&meta.harness).ok_or(Error::SandboxMetadataMissing)?;
+  let sandbox_type = parse_sandbox_type(&meta.sandbox).ok_or(Error::SandboxMetadataMissing)?;
+  validate_sandbox(sandbox_type)?;
 
-  let original = Repository::open(sandbox_path)
-    .ok()
-    .and_then(|r| r.config().ok())
-    .and_then(|c| c.get_string("so.original").ok())
-    .map(|s| std::path::PathBuf::from(s.trim()))
-    .ok_or(Error::OriginalRepoNotFound)?;
-
-  let sb = sandbox::Sandbox { path: sandbox_path.to_path_buf(), original, task_id: mdata.task_id.clone() };
+  let original = std::path::PathBuf::from(&meta.original);
+  let sb = sandbox::Sandbox { path: sandbox_path.to_path_buf(), original, task_id: meta.task_id };
 
   // reset status if done
   if let Some(status) = read_status(sandbox_path)
@@ -615,9 +630,10 @@ async fn continue_sandbox(sandbox_path: &Path, iterations: u32) -> Result<(), Er
   }
 
   // warn if gpu driver present but docker toolkit missing (linux + docker only)
-  warn_gpu_if_missing(mdata.sandbox);
+  warn_gpu_if_missing(sandbox_type);
 
-  match run_sandbox_iterations(&sb, mdata.harness, iterations, mdata.sandbox).await {
+  let iterations = effective_max(sandbox_path, iterations);
+  match run_sandbox_iterations(&sb, harness, iterations, sandbox_type).await {
     Ok(RunOutcome::Completed | RunOutcome::Interrupted) => Ok(()),
     Err(e) => Err(e),
   }
@@ -633,31 +649,21 @@ fn sandbox_name(original: &Path) -> String {
   original.file_name().map_or_else(|| "sandbox".into(), |n| n.to_string_lossy().to_string())
 }
 
-struct Mdata {
-  harness: Harness,
-  sandbox: SandboxType,
-  task_id: String,
+fn sandbox_name_from_path(sandbox_path: &Path) -> String {
+  sandbox_path.file_name().map_or_else(|| "sandbox".into(), |n| n.to_string_lossy().to_string())
 }
 
-fn set_mdata(path: &Path, harness: Harness, sandbox: SandboxType, task_id: &str) -> Result<(), Error> {
-  let repo = Repository::open(path)?;
-  let mut cfg = repo.config()?;
-  cfg.set_str("so.mdata.harness", harness.as_str())?;
-  cfg.set_str("so.mdata.sandbox", sandbox.as_str())?;
-  cfg.set_str("so.mdata.task-id", task_id)?;
-  Ok(())
-}
-
-fn read_mdata(path: &Path) -> Result<Mdata, Error> {
-  let repo = Repository::open(path)?;
-  let cfg = repo.config()?;
-  let harness = cfg.get_string("so.mdata.harness").ok().and_then(|v| parse_harness(&v));
-  let sandbox = cfg.get_string("so.mdata.sandbox").ok().and_then(|v| parse_sandbox_type(&v));
-  let task_id = cfg.get_string("so.mdata.task-id").ok();
-  match (harness, sandbox, task_id) {
-    (Some(h), Some(s), Some(t)) => Ok(Mdata { harness: h, sandbox: s, task_id: t }),
-    _ => Err(Error::SandboxMetadataMissing),
-  }
+fn write_sandbox_meta(sb: &sandbox::Sandbox, harness: Harness, sandbox_type: SandboxType) {
+  let sb_name = sandbox_name_from_path(&sb.path);
+  config::write_meta(
+    &sb_name,
+    &config::SandboxMeta {
+      original: sb.original.display().to_string(),
+      harness: harness.as_str().into(),
+      sandbox: sandbox_type.as_str().into(),
+      task_id: sb.task_id.clone(),
+    },
+  );
 }
 
 fn parse_harness(s: &str) -> Option<Harness> {

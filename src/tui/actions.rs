@@ -197,11 +197,8 @@ pub fn merge_sandbox(sandbox_path: &Path, orig: &Path) -> Result<(), Error> {
 }
 
 pub fn original_repo(cwd: &Path) -> Option<PathBuf> {
-  git2::Repository::open(cwd)
-    .ok()
-    .and_then(|r| r.config().ok())
-    .and_then(|c| c.get_string("so.original").ok())
-    .map(|s| PathBuf::from(s.trim()))
+  let name = cwd.file_name()?.to_string_lossy().to_string();
+  crate::config::read_meta(&name).map(|m| PathBuf::from(m.original))
 }
 
 fn find_delta() -> Option<PathBuf> {
