@@ -13,6 +13,28 @@ use crate::Error;
 
 pub const BASE_TAG: &str = "so-base";
 
+// creds directory guard, cleaned up on drop
+struct CredsDir(PathBuf);
+
+impl std::ops::Deref for CredsDir {
+  type Target = Path;
+  fn deref(&self) -> &Path {
+    &self.0
+  }
+}
+
+impl AsRef<Path> for CredsDir {
+  fn as_ref(&self) -> &Path {
+    &self.0
+  }
+}
+
+impl Drop for CredsDir {
+  fn drop(&mut self) {
+    let _ = std::fs::remove_dir_all(&self.0);
+  }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum SandboxType {
   #[default]
@@ -58,7 +80,7 @@ impl Sandbox {
     let task_id = format!("so-{project}-{ts}");
 
     copy_dir(original, &path)?;
-    setup_git(&path, original)?;
+    setup_git(&path)?;
     setup_specs(&path, prompt, mode)?;
 
     Ok(Self { path, original: original.to_path_buf(), task_id })
@@ -115,11 +137,8 @@ pub fn list() -> Result<Vec<Info>, Error> {
         "pending"
       };
       let repo = Repository::open(&path).ok();
-      let original = repo
-        .as_ref()
-        .and_then(|r| r.config().ok())
-        .and_then(|c| c.get_string("so.original").ok())
-        .map_or_else(|| PathBuf::from("."), |s| PathBuf::from(s.trim()));
+      let original =
+        crate::config::read_meta(&name).map(|m| PathBuf::from(m.original)).unwrap_or_else(|| PathBuf::from("."));
 
       // get git stats
       let (files_changed, insertions, deletions, commit_count) = repo.as_ref().map_or((0, 0, 0, 0), |r| {
@@ -173,7 +192,7 @@ pub struct DockerContainer {
   pub id: String,
   pub workdir: String,
   exec_user: Option<String>,
-  creds: PathBuf,
+  _creds: CredsDir,
 }
 
 impl DockerContainer {
@@ -194,7 +213,6 @@ impl DockerContainer {
   pub async fn stop(&self) {
     let _ = Command::new("docker").args(["stop", "-t", "0", &self.id]).output().await;
     let _ = Command::new("docker").args(["rm", "-f", &self.id]).output().await;
-    let _ = std::fs::remove_dir_all(&self.creds);
   }
 }
 
@@ -303,7 +321,8 @@ fn add_user(cmd: &mut Command) {
   }
 }
 
-pub async fn start_docker(sb: &Sandbox) -> Result<DockerContainer, Error> {
+pub async fn start_docker(sb: &Sandbox) -> Result<(DockerContainer, Vec<String>), Error> {
+  let mut messages: Vec<String> = Vec::new();
   let project = project_name(&sb.original).to_string_lossy();
   let dockerfile = sb.original.join("Dockerfile.sandbox");
   if !dockerfile.exists() {
@@ -317,9 +336,9 @@ pub async fn start_docker(sb: &Sandbox) -> Result<DockerContainer, Error> {
   // check if image matches dockerfile hash
   let hash = dockerfile_hash(&dockerfile).unwrap_or_default();
   if image_has_hash(&image, &hash).await {
-    log_activity(sb, "using cached image")?;
+    messages.push("using cached image".into());
   } else {
-    log_activity(sb, "building image...")?;
+    messages.push("building image...".into());
     let mut cmd = Command::new("docker");
     cmd
       .args(["build", "-q", "-t", &image, "--label", &format!("dockerfile.hash={hash}"), "-f"])
@@ -332,7 +351,7 @@ pub async fn start_docker(sb: &Sandbox) -> Result<DockerContainer, Error> {
     }
     let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let short = if sha.len() > 19 { &sha[7..19] } else { &sha };
-    log_activity(sb, &format!("built image {short}"))?;
+    messages.push(format!("built image {short}"));
   }
 
   let creds = setup_creds()?;
@@ -367,28 +386,19 @@ pub async fn start_docker(sb: &Sandbox) -> Result<DockerContainer, Error> {
   cmd.args(["tail", "-f", "/dev/null"]);
   cmd.stdout(Stdio::piped()).stderr(Stdio::inherit());
 
-  let output = match cmd.output().await {
-    Ok(o) => o,
-    Err(e) => {
-      let _ = std::fs::remove_dir_all(&creds);
-      return Err(Error::Docker(format!("spawn failed: {e}")));
-    }
-  };
-
+  let output = cmd.output().await.map_err(|e| Error::Docker(format!("spawn failed: {e}")))?;
   if !output.status.success() {
-    let _ = std::fs::remove_dir_all(&creds);
     return Err(Error::Docker("container start failed".into()));
   }
 
   let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
   if id.is_empty() {
-    let _ = std::fs::remove_dir_all(&creds);
     return Err(Error::Docker("no container id returned".into()));
   }
 
   let exec_user = if cfg!(target_os = "linux") { None } else { Some("1000:1000".into()) };
 
-  Ok(DockerContainer { id, workdir: code, exec_user, creds })
+  Ok((DockerContainer { id, workdir: code, exec_user, _creds: creds }, messages))
 }
 
 // =============================================================================
@@ -398,13 +408,13 @@ pub async fn start_docker(sb: &Sandbox) -> Result<DockerContainer, Error> {
 pub struct BwrapContext {
   args: Vec<OsString>,
   chdir: PathBuf,
-  creds: PathBuf,
+  _creds: CredsDir,
 }
 
 impl BwrapContext {
   pub fn new(sb: &Sandbox) -> Result<Self, Error> {
     let (args, chdir, creds) = build_bwrap_args(sb)?;
-    Ok(Self { args, chdir, creds })
+    Ok(Self { args, chdir, _creds: creds })
   }
 
   pub fn cmd(&self, program: &str) -> Command {
@@ -412,13 +422,7 @@ impl BwrapContext {
   }
 }
 
-impl Drop for BwrapContext {
-  fn drop(&mut self) {
-    let _ = std::fs::remove_dir_all(&self.creds);
-  }
-}
-
-fn build_bwrap_args(sb: &Sandbox) -> Result<(Vec<OsString>, PathBuf, PathBuf), Error> {
+fn build_bwrap_args(sb: &Sandbox) -> Result<(Vec<OsString>, PathBuf, CredsDir), Error> {
   let home = dirs::home_dir().ok_or(Error::NoHome)?;
   let code = home.join(project_name(&sb.original));
   let creds = setup_creds()?;
@@ -458,12 +462,19 @@ fn build_bwrap_args(sb: &Sandbox) -> Result<(Vec<OsString>, PathBuf, PathBuf), E
     if_exists_ro(&mut a, &home.join(d));
   }
 
-  // writable tool dirs (pure tmpfs)
+  // writable tool dirs (tmpfs base, host subdirs mounted ro)
   for dir in [".bun", ".local"] {
     let p = home.join(dir);
     check_dir(&mut a, &mut created_dirs, &p);
     push_arg(&mut a, "--tmpfs");
     push_path(&mut a, &p);
+    for sub in ["bin", "lib", "share", "install"] {
+      let sub_path = p.join(sub);
+      if sub_path.exists() {
+        ro(&mut a, &sub_path);
+        created_dirs.insert(sub_path);
+      }
+    }
   }
 
   // caches (tmpfs)
@@ -613,7 +624,7 @@ fn check_dir(a: &mut Vec<OsString>, created: &mut HashSet<PathBuf>, path: &Path)
 // Credentials
 // =============================================================================
 
-fn cleanup_stale_creds() {
+pub fn cleanup_stale_creds() {
   let Ok(entries) = std::fs::read_dir("/tmp") else { return };
   for entry in entries.flatten() {
     let name = entry.file_name();
@@ -621,20 +632,46 @@ fn cleanup_stale_creds() {
     let Some(pid_str) = name_str.strip_prefix("so-creds-") else { continue };
     let Ok(pid) = pid_str.parse::<i32>() else { continue };
 
-    // check if process is still running
-    let running = unsafe { libc::kill(pid, 0) == 0 };
-    if !running {
+    // dead pid, clean up
+    let alive = unsafe { libc::kill(pid, 0) == 0 };
+    if !alive {
+      let _ = std::fs::remove_dir_all(entry.path());
+      continue;
+    }
+
+    // alive pid, check for pid reuse via start time
+    let stored =
+      std::fs::read_to_string(entry.path().join(".so-starttime")).ok().and_then(|s| s.trim().parse::<u64>().ok());
+    let actual = proc_start_time(pid as u32);
+    if let (Some(s), Some(a)) = (stored, actual)
+      && s != a
+    {
+      // stale, different process reused this pid
       let _ = std::fs::remove_dir_all(entry.path());
     }
   }
 }
 
-fn setup_creds() -> Result<PathBuf, Error> {
+// read starttime (field 22) from /proc/<pid>/stat
+fn proc_start_time(pid: u32) -> Option<u64> {
+  let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+  // skip past comm field (parenthesized, may contain spaces)
+  let after_comm = stat.rfind(')')? + 1;
+  let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
+  // field 3 starts at index 0 after ')', so field 22 is index 19
+  fields.get(19)?.parse().ok()
+}
+
+fn setup_creds() -> Result<CredsDir, Error> {
   cleanup_stale_creds();
 
   let home = dirs::home_dir().ok_or(Error::NoHome)?;
   let creds = PathBuf::from(format!("/tmp/so-creds-{}", std::process::id()));
   std::fs::create_dir_all(&creds)?;
+  // write start time marker for pid-reuse detection
+  if let Some(st) = proc_start_time(std::process::id()) {
+    let _ = std::fs::write(creds.join(".so-starttime"), st.to_string());
+  }
   std::fs::create_dir_all(creds.join(".config"))?;
   std::fs::create_dir_all(creds.join(".local/share"))?;
   std::fs::create_dir_all(creds.join(".local/state/opencode"))?;
@@ -681,7 +718,7 @@ fn setup_creds() -> Result<PathBuf, Error> {
     let _ = std::fs::write(claude_dir.join(".credentials.json"), &output.stdout);
   }
 
-  Ok(creds)
+  Ok(CredsDir(creds))
 }
 
 fn copy_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<(), Error> {
@@ -713,7 +750,7 @@ fn copy_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<(), Error> 
 // Git setup
 // =============================================================================
 
-fn setup_git(sandbox: &Path, original: &Path) -> Result<String, Error> {
+fn setup_git(sandbox: &Path) -> Result<String, Error> {
   let repo = Repository::open(sandbox)?;
   let branch = repo.head()?.shorthand().unwrap_or("main").to_string();
   let sb_branch = format!("sandbox/{branch}");
@@ -739,7 +776,6 @@ fn setup_git(sandbox: &Path, original: &Path) -> Result<String, Error> {
   repo.tag_lightweight(BASE_TAG, &commit.into_object(), true)?;
   let mut cfg = repo.config()?;
   cfg.set_str("receive.denyCurrentBranch", "updateInstead")?;
-  cfg.set_str("so.original", &original.display().to_string())?;
 
   Ok(sb_branch)
 }
@@ -870,13 +906,6 @@ pub fn git_commits(p: &Path, base: &str) -> Result<Vec<(String, String)>, Error>
 // =============================================================================
 // Helpers
 // =============================================================================
-
-fn log_activity(sb: &Sandbox, msg: &str) -> Result<(), Error> {
-  let repo = Repository::open(&sb.path)?;
-  let mut cfg = repo.config()?;
-  cfg.set_multivar("so.activity", ".*", msg)?;
-  Ok(())
-}
 
 pub fn copy_dir(src: &Path, dst: &Path) -> Result<(), Error> {
   std::fs::create_dir_all(dst)?;
