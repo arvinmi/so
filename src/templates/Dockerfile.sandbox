@@ -3,7 +3,7 @@ FROM ubuntu:24.04
 
 RUN apt-get update -qq \
   && apt-get install -y --no-install-recommends sudo curl ca-certificates \
-  && useradd -m -s /bin/bash -u 1000 ubuntu \
+  && (id ubuntu >/dev/null 2>&1 || useradd -m -s /bin/bash -u 1000 ubuntu) \
   && echo "ubuntu ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
 USER ubuntu
