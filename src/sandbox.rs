@@ -50,7 +50,6 @@ fn project_name(p: &Path) -> &OsStr {
 pub struct Sandbox {
   pub path: PathBuf,
   pub original: PathBuf,
-  pub branch: String,
   pub task_id: String,
 }
 
@@ -62,19 +61,24 @@ impl Sandbox {
     let task_id = format!("so-{}-{}", project, ts);
 
     copy_dir(original, &path)?;
-    let branch = setup_git(&path, original)?;
+    setup_git(&path, original)?;
     setup_specs(&path, prompt, mode)?;
 
-    Ok(Self { path, original: original.to_path_buf(), branch, task_id })
+    Ok(Self { path, original: original.to_path_buf(), task_id })
   }
 }
 
+#[derive(Clone)]
 pub struct Info {
   pub name: String,
   pub path: PathBuf,
   pub original: PathBuf,
   pub created: std::time::SystemTime,
   pub status: String,
+  pub files_changed: u32,
+  pub insertions: u32,
+  pub deletions: u32,
+  pub commit_count: u32,
 }
 
 fn parse_sandbox_timestamp(name: &str) -> Option<u64> {
@@ -113,13 +117,55 @@ pub fn list() -> Result<Vec<Info>, Error> {
       } else {
         "pending"
       };
-      let original = Repository::open(&path)
-        .ok()
+      let repo = Repository::open(&path).ok();
+      let original = repo
+        .as_ref()
         .and_then(|r| r.config().ok())
         .and_then(|c| c.get_string("so.original").ok())
         .map(|s| PathBuf::from(s.trim()))
         .unwrap_or_else(|| PathBuf::from("."));
-      out.push(Info { name, path, original, created, status: status.into() });
+
+      // get git stats
+      let (files_changed, insertions, deletions, commit_count) = repo
+        .as_ref()
+        .map(|r| {
+          let base = git_base(&path, BASE_TAG);
+          let tree = r.revparse_single(&base).ok().and_then(|o| o.peel_to_tree().ok());
+          let diff = tree.and_then(|t| r.diff_tree_to_workdir_with_index(Some(&t), None).ok());
+          let stats = diff.and_then(|d| d.stats().ok());
+          let (f, i, d) =
+            stats.map(|s| (s.files_changed() as u32, s.insertions() as u32, s.deletions() as u32)).unwrap_or((0, 0, 0));
+
+          // count commits
+          let base_oid = r.revparse_single(&base).ok().map(|o| o.id());
+          let head_oid = r.head().ok().and_then(|h| h.target());
+          let commits = match (base_oid, head_oid) {
+            (Some(b), Some(h)) => r
+              .revwalk()
+              .ok()
+              .and_then(|mut w| {
+                w.push(h).ok()?;
+                w.hide(b).ok()?;
+                Some(w.count() as u32)
+              })
+              .unwrap_or(0),
+            _ => 0,
+          };
+          (f, i, d, commits)
+        })
+        .unwrap_or((0, 0, 0, 0));
+
+      out.push(Info {
+        name,
+        path,
+        original,
+        created,
+        status: status.into(),
+        files_changed,
+        insertions,
+        deletions,
+        commit_count,
+      });
     }
   }
   out.sort_by(|a, b| b.created.cmp(&a.created));
@@ -273,16 +319,17 @@ pub async fn start_docker(sb: &Sandbox) -> Result<DockerContainer, Error> {
   let image = format!("sandbox-{}", project.to_lowercase());
 
   // rebuild image if dockerfile changed
-  if image_is_fresh(&image, &dockerfile).await {
-    println!("{}", "▶ Using cached image".yellow().bold());
-  } else {
-    println!("{}", "▶ Building image".yellow().bold());
+  if !image_is_fresh(&image, &dockerfile).await {
+    log_activity(sb, "sandbox: building image")?;
     let mut cmd = Command::new("docker");
     cmd.args(["build", "-q", "-t", &image, "-f"]).arg(&dockerfile).arg(&sb.original);
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     if !cmd.status().await?.success() {
       return Err(Error::Docker("build failed".into()));
     }
+    log_activity(sb, "sandbox: image built")?;
+  } else {
+    log_activity(sb, "sandbox: using cached image")?;
   }
 
   let creds = setup_creds()?;
@@ -305,6 +352,8 @@ pub async fn start_docker(sb: &Sandbox) -> Result<DockerContainer, Error> {
   mount_creds(&mut cmd, &creds, &home);
 
   add_env(&mut cmd, "CLAUDE_CODE_TASK_LIST_ID", &sb.task_id);
+  add_env(&mut cmd, "SO_UNATTENDED", "1");
+  add_env(&mut cmd, "SO_TUI", "1");
   add_env(&mut cmd, "HOME", &home);
   add_env(&mut cmd, "XDG_CONFIG_HOME", &format!("{}/.config", home));
   add_env(&mut cmd, "XDG_DATA_HOME", &format!("{}/.local/share", home));
@@ -348,6 +397,8 @@ pub async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(
   let home = dirs::home_dir().ok_or(Error::NoHome)?;
   let code = home.join(project_name(&sb.original));
   let creds = setup_creds()?;
+
+  log_activity(sb, "sandbox: starting bwrap")?;
 
   let mut a: Vec<OsString> = Vec::new();
   let mut created_dirs: HashSet<PathBuf> = HashSet::new();
@@ -470,6 +521,7 @@ pub async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(
   ] {
     push_env(&mut a, k, v);
   }
+  push_env(&mut a, "SO_TUI", "1");
   push_env_if_set(&mut a, "MODEL");
   push_env_if_set(&mut a, "EFFORT");
 
@@ -490,7 +542,7 @@ pub async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(
     Ok(c) => c,
     Err(e) => {
       let _ = std::fs::remove_dir_all(&creds);
-      return Err(Error::Other(format!("bwrap spawn failed: {}", e)));
+      return Err(Error::BwrapSpawn(e.to_string()));
     }
   };
 
@@ -499,7 +551,8 @@ pub async fn run_bwrap(sb: &Sandbox, harness: &str, iterations: u32) -> Result<(
 
   match result {
     Ok(s) if s.success() => Ok(()),
-    Ok(s) => Err(Error::Other(format!("bwrap exited with code {}", s.code().unwrap_or(-1)))),
+    Ok(s) if s.code() == Some(130) => Err(Error::Interrupted),
+    Ok(s) => Err(Error::BwrapExit(s.code().unwrap_or(-1))),
     Err(e) => Err(e),
   }
 }
@@ -824,6 +877,13 @@ pub fn git_commits(p: &Path, base: &str) -> Result<Vec<(String, String)>, Error>
 // =============================================================================
 // Helpers
 // =============================================================================
+
+fn log_activity(sb: &Sandbox, msg: &str) -> Result<(), Error> {
+  let repo = Repository::open(&sb.path)?;
+  let mut cfg = repo.config()?;
+  cfg.set_multivar("so.activity", ".*", msg)?;
+  Ok(())
+}
 
 pub fn copy_dir(src: &Path, dst: &Path) -> Result<(), Error> {
   std::fs::create_dir_all(dst)?;
