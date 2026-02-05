@@ -146,3 +146,8 @@ effort = "medium"
 ```
 
 > Note: All fields are optional. CLI flags take priority.
+
+## Inspiration
+
+- [FastRender](https://simonwillison.net/2026/Jan/23/fastrender/) - Cursor's parallel agent coordination harness
+- [The Ralph Wiggum Loop](https://www.youtube.com/watch?v=4Nna09dG_c0) - Better context window management
