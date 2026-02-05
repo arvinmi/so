@@ -765,6 +765,7 @@ async fn run_harness_loop(
   }
 
   for i in start_iter..=max_iter {
+    let head_before = crate::sandbox::git_head(&cwd).ok();
     let _ = tx.send(HarnessEvent::IterationStart { n: i });
 
     if let Err(e) = run_single_iteration(harness, mode, i, max_iter, &cwd, &tx, backend.as_ref()).await {
@@ -777,9 +778,11 @@ async fn run_harness_loop(
       return;
     }
 
-    // update iteration with commit message after successful commit
-    if let Some((_, msg)) =
-      crate::sandbox::git_commits(&cwd, crate::sandbox::BASE_TAG).ok().and_then(|c| c.into_iter().next())
+    // only mark committed if HEAD actually moved (new commit was made)
+    let head_after = crate::sandbox::git_head(&cwd).ok();
+    if head_before != head_after
+      && let Some((_, msg)) =
+        crate::sandbox::git_commits(&cwd, crate::sandbox::BASE_TAG).ok().and_then(|c| c.into_iter().next())
     {
       let _ = tx.send(HarnessEvent::IterationCommitted { n: i, msg });
     }
@@ -799,7 +802,10 @@ async fn enforce_commit_tui(
   tx: &mpsc::UnboundedSender<HarnessEvent>,
   backend: Option<&TuiBackend>,
 ) -> Result<(), Error> {
-  let msg = "Commit now. Do not ask questions. Always commit no matter what.\nIf there are no changes, make an empty commit with --allow-empty.\nMessage format:\n- What: <what was done>\n- Why: <reasoning>\n- Alternatives: <what else was considered>";
+  let msg = "Commit all changes now. Do not ask questions.\n\
+    Add untracked build artifacts to .gitignore before committing.\n\
+    If nothing to commit, use git commit --allow-empty.\n\
+    Message format:\n<title>\nWhy: <reasoning>\nAlternatives: <what else was considered>";
   for i in 1..=3 {
     if !crate::sandbox::git_dirty(cwd).unwrap_or(false) {
       return Ok(());
@@ -812,11 +818,17 @@ async fn enforce_commit_tui(
       break;
     }
   }
+  // if still dirty, clean untracked files and check again
   if crate::sandbox::git_dirty(cwd).unwrap_or(false) {
-    let _ = tx.send(HarnessEvent::Activity {
-      kind: ActivityKind::Text,
-      content: "error: failed to commit after 3 attempts".into(),
-    });
+    crate::sandbox::git_clean_untracked(cwd);
+    if crate::sandbox::git_dirty(cwd).unwrap_or(false) {
+      let _ = tx.send(HarnessEvent::Activity {
+        kind: ActivityKind::Text,
+        content: "error: failed to commit after 3 attempts".into(),
+      });
+    } else {
+      let _ = tx.send(HarnessEvent::Activity { kind: ActivityKind::Text, content: "cleaned untracked files".into() });
+    }
   }
   Ok(())
 }

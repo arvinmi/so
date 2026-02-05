@@ -704,6 +704,13 @@ fn setup_creds() -> Result<CredsDir, Error> {
     std::fs::copy(home.join(".claude.json"), creds.join(".claude.json"))?;
   }
 
+  // clean up claude code backup files
+  for entry in std::fs::read_dir(&home).into_iter().flatten().flatten() {
+    if entry.file_name().to_string_lossy().starts_with(".claude.json.backup.") {
+      let _ = std::fs::remove_file(entry.path());
+    }
+  }
+
   // for macos, claude stores credentials in keychain, extract them for docker
   #[cfg(target_os = "macos")]
   if let Some(output) = std::process::Command::new("security")
@@ -835,6 +842,18 @@ pub fn git_dirty(p: &Path) -> Result<bool, Error> {
   opts.include_untracked(true).include_ignored(false);
   let statuses = repo.statuses(Some(&mut opts))?;
   Ok(!statuses.is_empty())
+}
+
+// removes untracked files and directories from the working tree
+pub fn git_clean_untracked(p: &Path) -> bool {
+  std::process::Command::new("git")
+    .args(["clean", "-fd"])
+    .current_dir(p)
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false)
 }
 
 pub fn git_head(p: &Path) -> Result<String, Error> {

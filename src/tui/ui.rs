@@ -5,7 +5,7 @@ use ratatui::{
   layout::{Constraint, Layout, Rect},
   style::{Color, Modifier, Style},
   text::{Line, Span},
-  widgets::{List, ListItem, Paragraph},
+  widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -129,8 +129,14 @@ fn render_iterations_section(frame: &mut Frame, area: Rect, state: &AppState) {
 
   frame.render_widget(Paragraph::new(box_header(&label, width, header_color)), header_area);
 
-  // content with side borders
-  let visible_height = content_area.height as usize;
+  // content with Block for side borders
+  let border_block =
+    Block::default().borders(Borders::LEFT | Borders::RIGHT).border_style(Style::default().fg(BORDER_GRAY));
+  let inner = border_block.inner(content_area);
+  frame.render_widget(border_block, content_area);
+
+  let inner_width = inner.width as usize;
+  let visible_height = inner.height as usize;
   let spin = ["◐", "◓", "◑", "◒"];
   let spin_idx = (state.start_time.elapsed().as_millis() / 1500 % 4) as usize;
 
@@ -156,28 +162,29 @@ fn render_iterations_section(frame: &mut Frame, area: Rect, state: &AppState) {
 
       let dur = iter.elapsed().map_or_else(|| "[--:--]".into(), |d| format!("[{}]", fmt_duration_short(d)));
       let num = format!("{:>2}", iter.number);
-      let max_task = width.saturating_sub(9 + dur.chars().count());
+      let icon_part = format!(" {icon} ");
+      let num_part = format!("{num}  ");
+      let fixed = icon_part.width() + num_part.width() + 1;
+      let max_task = inner_width.saturating_sub(fixed + dur.width());
       let task_str = truncate_str(&task, max_task);
-      let pad = width.saturating_sub(8 + task_str.width() + dur.chars().count());
+      let pad = inner_width.saturating_sub(fixed + task_str.width() + dur.width());
 
-      let line = Line::from(vec![
-        Span::styled("│", Style::default().fg(BORDER_GRAY)),
-        Span::styled(format!(" {icon} "), Style::default().fg(color)),
-        Span::styled(format!("{num}  "), Style::default().fg(TEXT_WHITE)),
+      ListItem::new(Line::from(vec![
+        Span::styled(icon_part, Style::default().fg(color)),
+        Span::styled(num_part, Style::default().fg(TEXT_WHITE)),
         Span::styled(task_str, Style::default().fg(TEXT_WHITE)),
         Span::raw(" "),
         Span::styled(dur, Style::default().fg(DIM_GRAY)),
         Span::raw(" ".repeat(pad)),
-        Span::styled("│", Style::default().fg(BORDER_GRAY)),
-      ]);
-
-      ListItem::new(line)
+      ]))
     })
     .collect();
 
-  // fill remaining with empty bordered lines
-  let list = List::new(fill_list(items, visible_height, width));
-  frame.render_widget(list, content_area);
+  let mut filled = items;
+  while filled.len() < visible_height {
+    filled.push(ListItem::new(Line::raw("")));
+  }
+  frame.render_widget(List::new(filled), inner);
 
   frame.render_widget(Paragraph::new(box_footer(width, BORDER_GRAY)), footer_area);
 }
@@ -196,8 +203,14 @@ fn render_activity_section(frame: &mut Frame, area: Rect, state: &AppState) {
 
   frame.render_widget(Paragraph::new(box_header(label, width, header_color)), header_area);
 
-  // content with side borders
-  let visible_height = content_area.height as usize;
+  // content with Block for side borders
+  let border_block =
+    Block::default().borders(Borders::LEFT | Borders::RIGHT).border_style(Style::default().fg(BORDER_GRAY));
+  let inner = border_block.inner(content_area);
+  frame.render_widget(border_block, content_area);
+
+  let inner_width = inner.width as usize;
+  let visible_height = inner.height as usize;
   let total = state.activity.len();
   let start =
     if total > visible_height + state.scroll_offset { total - visible_height - state.scroll_offset } else { 0 };
@@ -210,7 +223,6 @@ fn render_activity_section(frame: &mut Frame, area: Rect, state: &AppState) {
     .skip(start)
     .take(visible_height)
     .map(|entry| {
-      // time = elapsed from run start
       let elapsed = entry.timestamp.saturating_duration_since(state.start_time);
       let mins = elapsed.as_secs() / 60;
       let secs = elapsed.as_secs() % 60;
@@ -223,53 +235,34 @@ fn render_activity_section(frame: &mut Frame, area: Rect, state: &AppState) {
         ActivityKind::Thinking | ActivityKind::Text | ActivityKind::Code => ("", false),
       };
 
-      // fixed parts: │ (1) + time (8) + harness (9) + │ (1) = 19 chars
       let time_part = format!(" {time_str}  ");
       let harness_part = format!("{harness:<8} ");
       let content = format!("{}{}", prefix, entry.content);
-      let fixed_width = 19;
-      let max_content = width.saturating_sub(fixed_width);
+      let fixed_width = time_part.width() + harness_part.width();
+      let max_content = inner_width.saturating_sub(fixed_width);
       let display = truncate_str(&content, max_content);
-      let padding = width.saturating_sub(fixed_width + display.width());
+      let padding = inner_width.saturating_sub(fixed_width + display.width());
       let text_color = if is_tool { TEXT_WHITE } else { DIM_GRAY };
 
-      let line = Line::from(vec![
-        Span::styled("│", Style::default().fg(BORDER_GRAY)),
+      ListItem::new(Line::from(vec![
         Span::styled(time_part, Style::default().fg(DIM_GRAY)),
         Span::styled(harness_part, Style::default().fg(CYAN)),
         Span::styled(display, Style::default().fg(text_color)),
         Span::raw(" ".repeat(padding)),
-        Span::styled("│", Style::default().fg(BORDER_GRAY)),
-      ]);
-
-      ListItem::new(line)
+      ]))
     })
     .collect();
 
-  // fill remaining with empty bordered lines
-  let list = List::new(fill_list(items, visible_height, width));
-  frame.render_widget(list, content_area);
+  let mut filled = items;
+  while filled.len() < visible_height {
+    filled.push(ListItem::new(Line::raw("")));
+  }
+  frame.render_widget(List::new(filled), inner);
 
   // footer: └ ^C quit │ ↑↓ scroll ─────────┘
   let keys = " ^C quit │ ↑↓ scroll ";
 
   frame.render_widget(Paragraph::new(box_footer_keys(keys, width, BORDER_GRAY)), footer_area);
-}
-
-fn empty_bordered_line(width: usize) -> ListItem<'static> {
-  let padding = width.saturating_sub(2);
-  ListItem::new(Line::from(vec![
-    Span::styled("│", Style::default().fg(BORDER_GRAY)),
-    Span::raw(" ".repeat(padding)),
-    Span::styled("│", Style::default().fg(BORDER_GRAY)),
-  ]))
-}
-
-fn fill_list(mut items: Vec<ListItem>, visible_height: usize, width: usize) -> Vec<ListItem> {
-  while items.len() < visible_height {
-    items.push(empty_bordered_line(width));
-  }
-  items
 }
 
 fn box_header(label: &str, width: usize, label_color: Color) -> Line<'static> {

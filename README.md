@@ -2,6 +2,8 @@
 
 A sandbox orchestrator for your agents.
 
+<img src="images/run-tui.jpg" alt="so run tui" width="1000"/>
+
 ## Why so?
 
 Run coding agents in isolated sandboxes so they can't break your host. Changes stay contained until you review and merge them back into your codebase.
