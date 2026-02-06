@@ -2,7 +2,7 @@
 
 A sandbox orchestrator for your agents.
 
-<img src="images/run-tui.jpg" alt="so run tui" width="1000"/>
+<img src="images/demo.gif" alt="so demo" width="1000"/>
 
 ## Why so?
 
